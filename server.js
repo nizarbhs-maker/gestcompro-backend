@@ -363,25 +363,27 @@ app.get("/api/ttn/statut", limiteurIP("statut TTN", 60), verifierAuthApplicative
 
 
 // ===================== Recherche OpenStreetMap (utilisée par la prospection) =====================
-// Recherche d'entreprises sur OpenStreetMap — sans dépendance, testable seule.
-//   1) Nominatim : transforme la zone (« Jemmal, Monastir ») en rectangle géographique ;
-//   2) Overpass  : liste les commerces/établissements du segment dans ce rectangle (tags OSM) ;
-//   3) repli     : recherche texte Nominatim si Overpass ne répond pas ou ne trouve rien.
-// Règles des services publics OpenStreetMap respectées : Nominatim 1 requête/seconde maximum,
-// User-Agent identifiant l'application, Overpass avec bascule sur un second serveur (429/5xx).
-
+// Correctif 04/10 : le serveur public Nominatim refusait les requêtes venant de Render (réponse 429,
+// adresses IP partagées par de nombreux services). La recherche n'en dépend plus :
+//   1) localisation de la zone par Overpass (lieu ou limite administrative portant ce nom, accents
+//      et majuscules ignorés), sinon Photon (géocodeur OpenStreetMap), sinon Nominatim en dernier ;
+//   2) établissements du segment par Overpass, autour du lieu ou dans la limite trouvée ;
+//   3) repli recherche texte par Photon, puis Nominatim.
+// Une panne d'un service n'arrête plus la recherche : elle est signalée dans les notes.
 const NOMINATIM = "https://nominatim.openstreetmap.org";
+const PHOTON = "https://photon.komoot.io/api/";
 const OVERPASS = [
   "https://overpass-api.de/api/interpreter",
   "https://overpass.private.coffee/api/interpreter",
+  "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
 ];
+const BBOX_TUNISIE = [30.2, 7.5, 37.6, 11.7]; // sud, ouest, nord, est
 const CONTACT = process.env.OSM_CONTACT || "";
 const USER_AGENT = "GestComPro/1.0 (prospection commerciale" + (CONTACT ? "; " + CONTACT : "") + ")";
 
 const pause = (ms) => new Promise((r) => setTimeout(r, ms));
 let derniereNominatim = 0;
 let fileNominatim = Promise.resolve();
-// Une seule requête Nominatim à la fois, au moins 1,1 s entre deux (limite : 1 requête/seconde).
 function espacerNominatim(delaiMs = 1100) {
   const tache = fileNominatim.then(async () => {
     const attendre = derniereNominatim + delaiMs - Date.now();
@@ -391,7 +393,6 @@ function espacerNominatim(delaiMs = 1100) {
   fileNominatim = tache.catch(() => {});
   return tache;
 }
-
 async function fetchAvecDelai(fetchImpl, url, options = {}, delaiMs = 30000) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), delaiMs);
@@ -399,52 +400,17 @@ async function fetchAvecDelai(fetchImpl, url, options = {}, delaiMs = 30000) {
   finally { clearTimeout(t); }
 }
 
-const cacheZones = new Map(); // zone -> {valeur, expire}
-async function geocoderZone(zone, fetchImpl = fetch, delaiMs = 1100) {
-  const cle = String(zone).toLowerCase().trim();
-  const c = cacheZones.get(cle);
-  if (c && c.expire > Date.now()) return c.valeur;
-  await espacerNominatim(delaiMs);
-  const url = `${NOMINATIM}/search?q=${encodeURIComponent(zone + " Tunisie")}&format=jsonv2&limit=1&countrycodes=tn&accept-language=fr`;
-  const r = await fetchAvecDelai(fetchImpl, url, { headers: { "User-Agent": USER_AGENT } }, 15000);
-  if (!r.ok) throw new Error("Nominatim a répondu " + r.status);
-  const j = await r.json();
-  const x = Array.isArray(j) && j[0];
-  let valeur = null;
-  if (x && x.boundingbox && x.boundingbox.length === 4) {
-    valeur = { bbox: bboxCorrigee(x.boundingbox.map(Number)), nom: x.display_name || zone, lat: Number(x.lat), lon: Number(x.lon) };
+// Nom → expression régulière tolérante : accents, majuscules, tirets, apostrophes et espaces.
+function motifNom(nom) {
+  const classes = { a: "[aàâä]", e: "[eéèêë]", i: "[iîï]", o: "[oôö]", u: "[uùûü]", c: "[cç]" };
+  const base = String(nom || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim();
+  let out = "";
+  for (const ch of base) {
+    if (/[a-z]/.test(ch)) out += classes[ch] || ch;
+    else if (/[0-9]/.test(ch)) out += ch;
+    else if (/[\s'’\-]/.test(ch)) { if (!out.endsWith("[-' ]*")) out += "[-' ]*"; }
   }
-  cacheZones.set(cle, { valeur, expire: Date.now() + 24 * 3600 * 1000 });
-  return valeur;
-}
-
-// Nominatim renvoie [sud, nord, ouest, est]. Un point isolé reçoit une marge minimale (≈ 3 km), et
-// un très grand territoire (gouvernorat) est plafonné pour garder une requête Overpass raisonnable.
-function bboxCorrigee([s, n, w, e], minDemi = 0.03, maxDemi = 0.7) {
-  const cLat = (s + n) / 2, cLon = (w + e) / 2;
-  const dLat = Math.min(maxDemi, Math.max(minDemi, (n - s) / 2));
-  const dLon = Math.min(maxDemi, Math.max(minDemi, (e - w) / 2));
-  return [cLat - dLat, cLon - dLon, cLat + dLat, cLon + dLon]; // [sud, ouest, nord, est] — ordre Overpass
-}
-
-// Filtres OSM reçus du navigateur : [{cle:"amenity", valeurs:["pharmacy"]}] — validés strictement
-// pour qu'aucun texte libre n'atteigne la requête Overpass.
-const RE_CLE = /^[a-z][a-z0-9_:]{0,30}$/;
-const RE_VAL = /^[a-z0-9_]{1,40}$/;
-function filtresValides(osm) {
-  if (!Array.isArray(osm)) return [];
-  return osm.slice(0, 8).map((f) => {
-    if (!f || !RE_CLE.test(String(f.cle || ""))) return null;
-    const valeurs = (Array.isArray(f.valeurs) ? f.valeurs : []).map(String).filter((v) => RE_VAL.test(v)).slice(0, 12);
-    return { cle: f.cle, valeurs };
-  }).filter(Boolean);
-}
-function construireRequeteOverpass(bbox, filtres, limite = 60) {
-  const [s, w, n, e] = bbox.map((v) => Number(v).toFixed(5));
-  const lignes = filtres.map((f) => f.valeurs.length
-    ? `nwr["${f.cle}"~"^(${f.valeurs.join("|")})$"]["name"](${s},${w},${n},${e});`
-    : `nwr["${f.cle}"]["name"](${s},${w},${n},${e});`);
-  return `[out:json][timeout:25];(${lignes.join("")});out center tags ${Math.max(5, Math.min(200, limite))};`;
+  return out;
 }
 
 async function appelerOverpass(requete, fetchImpl = fetch, serveurs = OVERPASS) {
@@ -465,6 +431,96 @@ async function appelerOverpass(requete, fetchImpl = fetch, serveurs = OVERPASS) 
   throw derniereErreur || new Error("Overpass indisponible");
 }
 
+const RANG_LIEU = { city: 1, town: 2, village: 3, suburb: 4, quarter: 5, neighbourhood: 6, hamlet: 7, locality: 8 };
+const RAYON_LIEU = { city: 8000, town: 5000, village: 3000, suburb: 2500, quarter: 2000, neighbourhood: 1500, hamlet: 2000, locality: 2500 };
+// Localisation par Overpass : lieux (node place=…) et limites administratives portant ce nom.
+async function localiserParOverpass(nom, portee, fetchImpl, serveurs) {
+  const motif = motifNom(nom);
+  if (!motif || motif.length < 3) return null;
+  const [s, w, n, e] = BBOX_TUNISIE;
+  const cles = `~"^(name|name:fr|name:en|int_name|alt_name|official_name)$"~"^${motif}$",i`;
+  const q = `[out:json][timeout:20];(node["place"~"^(city|town|village|suburb|quarter|neighbourhood|hamlet|locality)$"][${cles}](${s},${w},${n},${e});relation["boundary"="administrative"][${cles}](${s},${w},${n},${e}););out tags center bb 20;`;
+  const els = await appelerOverpass(q, fetchImpl, serveurs);
+  const rels = els.filter((x) => x.type === "relation" && x.bounds);
+  const lieux = els.filter((x) => x.type === "node" && x.tags && x.tags.place).sort((a, b) => (RANG_LIEU[a.tags.place] || 9) - (RANG_LIEU[b.tags.place] || 9));
+  if (portee === "gouvernorat") {
+    const r = rels.sort((a, b) => (Number(a.tags.admin_level) || 9) - (Number(b.tags.admin_level) || 9))[0];
+    if (r) return { bbox: [r.bounds.minlat, r.bounds.minlon, r.bounds.maxlat, r.bounds.maxlon], nom, source: "Overpass" };
+  }
+  if (lieux.length) { const p = lieux[0]; return { lat: p.lat, lon: p.lon, rayon: RAYON_LIEU[p.tags.place] || 4000, nom, source: "Overpass" }; }
+  const r = rels.sort((a, b) => (Number(b.tags.admin_level) || 0) - (Number(a.tags.admin_level) || 0))[0];
+  if (r) return { bbox: [r.bounds.minlat, r.bounds.minlon, r.bounds.maxlat, r.bounds.maxlon], nom, source: "Overpass" };
+  return null;
+}
+async function localiserParPhoton(zone, fetchImpl) {
+  const [s, w, n, e] = BBOX_TUNISIE;
+  const url = `${PHOTON}?q=${encodeURIComponent(zone + " Tunisie")}&limit=1&bbox=${w},${s},${e},${n}`;
+  const r = await fetchAvecDelai(fetchImpl, url, { headers: { "User-Agent": USER_AGENT } }, 15000);
+  if (!r.ok) throw new Error("Photon a répondu " + r.status);
+  const j = await r.json();
+  const f = j && Array.isArray(j.features) && j.features[0];
+  if (!f || !f.geometry) return null;
+  const [lon, lat] = f.geometry.coordinates;
+  const ext = f.properties && f.properties.extent; // [ouest, nord, est, sud]
+  if (Array.isArray(ext) && ext.length === 4) return { bbox: bboxCorrigee([ext[3], ext[1], ext[0], ext[2]]), nom: zone, source: "Photon" };
+  return { lat, lon, rayon: 4000, nom: zone, source: "Photon" };
+}
+async function localiserParNominatim(zone, fetchImpl, delaiMs) {
+  await espacerNominatim(delaiMs);
+  const url = `${NOMINATIM}/search?q=${encodeURIComponent(zone + " Tunisie")}&format=jsonv2&limit=1&countrycodes=tn&accept-language=fr`;
+  const r = await fetchAvecDelai(fetchImpl, url, { headers: { "User-Agent": USER_AGENT } }, 15000);
+  if (!r.ok) throw new Error("Nominatim a répondu " + r.status);
+  const j = await r.json();
+  const x = Array.isArray(j) && j[0];
+  if (x && x.boundingbox && x.boundingbox.length === 4) return { bbox: bboxCorrigee(x.boundingbox.map(Number)), nom: zone, source: "Nominatim" };
+  return null;
+}
+const cacheZones = new Map();
+async function localiserZone({ ville, gouvernorat, portee }, fetchImpl = fetch, options = {}) {
+  const nom = portee === "gouvernorat" ? (gouvernorat || ville) : (ville || gouvernorat);
+  const cle = (portee || "") + "|" + String(nom).toLowerCase() + "|" + String(gouvernorat || "").toLowerCase();
+  const c = cacheZones.get(cle);
+  if (c && c.expire > Date.now()) return { zone: c.valeur, notes: [] };
+  const notes = [];
+  const essais = [
+    () => localiserParOverpass(nom, portee, fetchImpl, options.serveursOverpass || OVERPASS),
+    () => localiserParPhoton([ville, gouvernorat].filter(Boolean).join(" "), fetchImpl),
+    () => localiserParNominatim([ville, gouvernorat].filter(Boolean).join(" "), fetchImpl, options.delaiNominatim),
+  ];
+  for (const essai of essais) {
+    try { const z = await essai(); if (z) { cacheZones.set(cle, { valeur: z, expire: Date.now() + 7 * 24 * 3600 * 1000 }); return { zone: z, notes }; } }
+    catch (err) { notes.push(err.message); }
+  }
+  return { zone: null, notes };
+}
+// Compatibilité avec la route de test et les anciens appels
+async function geocoderZone(zone, fetchImpl = fetch) { const r = await localiserZone({ ville: zone }, fetchImpl); return r.zone; }
+
+function bboxCorrigee([s, n, w, e], minDemi = 0.03, maxDemi = 0.7) {
+  const cLat = (s + n) / 2, cLon = (w + e) / 2;
+  const dLat = Math.min(maxDemi, Math.max(minDemi, (n - s) / 2));
+  const dLon = Math.min(maxDemi, Math.max(minDemi, (e - w) / 2));
+  return [cLat - dLat, cLon - dLon, cLat + dLat, cLon + dLon];
+}
+const RE_CLE = /^[a-z][a-z0-9_:]{0,30}$/;
+const RE_VAL = /^[a-z0-9_]{1,40}$/;
+function filtresValides(osm) {
+  if (!Array.isArray(osm)) return [];
+  return osm.slice(0, 8).map((f) => {
+    if (!f || !RE_CLE.test(String(f.cle || ""))) return null;
+    const valeurs = (Array.isArray(f.valeurs) ? f.valeurs : []).map(String).filter((v) => RE_VAL.test(v)).slice(0, 12);
+    return { cle: f.cle, valeurs };
+  }).filter(Boolean);
+}
+// Zone : {bbox:[s,w,n,e]} ou {lat, lon, rayon} (mètres)
+function construireRequeteOverpass(zone, filtres, limite = 60) {
+  const ou = zone.bbox ? zone.bbox.map((v) => Number(v).toFixed(5)).join(",")
+    : `around:${Math.round(zone.rayon || 4000)},${Number(zone.lat).toFixed(5)},${Number(zone.lon).toFixed(5)}`;
+  const lignes = filtres.map((f) => f.valeurs.length
+    ? `nwr["${f.cle}"~"^(${f.valeurs.join("|")})$"]["name"](${ou});`
+    : `nwr["${f.cle}"]["name"](${ou});`);
+  return `[out:json][timeout:25];(${lignes.join("")});out center tags ${Math.max(5, Math.min(200, limite))};`;
+}
 function ficheDepuisOverpass(el, villeParDefaut = "") {
   const t = el.tags || {};
   const rue = [t["addr:housenumber"], t["addr:street"]].filter(Boolean).join(" ");
@@ -472,19 +528,15 @@ function ficheDepuisOverpass(el, villeParDefaut = "") {
   const lat = el.lat ?? (el.center && el.center.lat) ?? null;
   const lon = el.lon ?? (el.center && el.center.lon) ?? null;
   return {
-    placeId: "",
-    osmId: el.type && el.id ? `${el.type}/${el.id}` : "",
-    nom: t.name || t["name:fr"] || "",
-    adresse,
-    ville: t["addr:city"] || t["addr:town"] || t["addr:village"] || villeParDefaut,
+    placeId: "", osmId: el.type && el.id ? `${el.type}/${el.id}` : "",
+    nom: t["name:fr"] || t.name || "",
+    adresse, ville: t["addr:city"] || t["addr:town"] || t["addr:village"] || villeParDefaut,
     tel: t.phone || t["contact:phone"] || t.mobile || t["contact:mobile"] || "",
     siteWeb: t.website || t["contact:website"] || "",
     note: null, nbAvis: null,
-    lat: lat !== null ? Number(lat) : null, lng: lon !== null ? Number(lon) : null,
-    statutGoogle: "",
+    lat: lat !== null ? Number(lat) : null, lng: lon !== null ? Number(lon) : null, statutGoogle: "",
   };
 }
-
 const norm = (v) => String(v || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]/g, "");
 function dedoublonner(fiches) {
   const vus = new Set();
@@ -494,44 +546,62 @@ function dedoublonner(fiches) {
     vus.add(cle); return true;
   });
 }
-
-// Repli : recherche texte Nominatim (moins précise : surtout utile pour un nom d'entreprise).
-async function rechercheTexteNominatim({ requete, zone, limite = 20 }, fetchImpl = fetch, delaiMs = 1100) {
+async function rechercheTextePhoton({ requete, zoneTexte, zone, limite }, fetchImpl) {
+  const [s, w, n, e] = zone && zone.bbox ? zone.bbox : BBOX_TUNISIE;
+  const centre = zone && zone.lat ? `&lat=${zone.lat}&lon=${zone.lon}` : "";
+  const url = `${PHOTON}?q=${encodeURIComponent(requete + " " + zoneTexte)}&limit=${Math.min(40, limite)}&bbox=${w},${s},${e},${n}${centre}`;
+  const r = await fetchAvecDelai(fetchImpl, url, { headers: { "User-Agent": USER_AGENT } }, 20000);
+  if (!r.ok) throw new Error("Photon a répondu " + r.status);
+  const j = await r.json();
+  return (j && Array.isArray(j.features) ? j.features : []).map((f) => {
+    const p = f.properties || {}, c = (f.geometry && f.geometry.coordinates) || [];
+    return {
+      placeId: "", osmId: p.osm_type && p.osm_id ? `${({N:"node",W:"way",R:"relation"})[p.osm_type] || p.osm_type}/${p.osm_id}` : "",
+      nom: p.name || "", adresse: [[p.housenumber, p.street].filter(Boolean).join(" "), p.city || p.district].filter(Boolean).join(", "),
+      ville: p.city || p.district || "", tel: "", siteWeb: "", note: null, nbAvis: null,
+      lat: c[1] ?? null, lng: c[0] ?? null, statutGoogle: "",
+    };
+  }).filter((x) => x.nom);
+}
+async function rechercheTexteNominatim({ requete, zoneTexte, limite }, fetchImpl, delaiMs) {
   await espacerNominatim(delaiMs);
-  const url = `${NOMINATIM}/search?q=${encodeURIComponent(requete + " " + zone + " Tunisie")}&format=jsonv2&addressdetails=1&extratags=1&limit=${Math.min(40, limite)}&countrycodes=tn&accept-language=fr`;
+  const url = `${NOMINATIM}/search?q=${encodeURIComponent(requete + " " + zoneTexte + " Tunisie")}&format=jsonv2&addressdetails=1&extratags=1&limit=${Math.min(40, limite)}&countrycodes=tn&accept-language=fr`;
   const r = await fetchAvecDelai(fetchImpl, url, { headers: { "User-Agent": USER_AGENT } }, 20000);
   if (!r.ok) throw new Error("Nominatim a répondu " + r.status);
   const j = await r.json();
   return (Array.isArray(j) ? j : []).map((x) => ({
     placeId: "", osmId: x.osm_type && x.osm_id ? `${x.osm_type}/${x.osm_id}` : "",
-    nom: x.name || String(x.display_name || "").split(",")[0],
-    adresse: x.display_name || "",
-    ville: (x.address && (x.address.town || x.address.city || x.address.village)) || zone,
+    nom: x.name || String(x.display_name || "").split(",")[0], adresse: x.display_name || "",
+    ville: (x.address && (x.address.town || x.address.city || x.address.village)) || "",
     tel: (x.extratags && (x.extratags.phone || x.extratags["contact:phone"])) || "",
     siteWeb: (x.extratags && (x.extratags.website || x.extratags["contact:website"])) || "",
     note: null, nbAvis: null, lat: parseFloat(x.lat) || null, lng: parseFloat(x.lon) || null, statutGoogle: "",
   })).filter((x) => x.nom);
 }
-
-// Point d'entrée : Overpass si des filtres de segment sont fournis, sinon (ou en cas d'échec) repli texte.
-async function rechercheOSM({ requete, zone, osm, limite = 40 }, fetchImpl = fetch, options = {}) {
+// Point d'entrée. Ne lève jamais d'erreur : en cas de panne générale, renvoie 0 résultat et des notes.
+async function rechercheOSM({ requete, ville, gouvernorat, portee, osm, limite = 40 }, fetchImpl = fetch, options = {}) {
   const filtres = filtresValides(osm);
   const notes = [];
-  if (filtres.length) {
+  const zoneTexte = [...new Set([ville, gouvernorat].filter(Boolean))].join(" ");
+  const loc = await localiserZone({ ville, gouvernorat, portee }, fetchImpl, options);
+  const zone = loc.zone;
+  if (!zone) notes.push("zone introuvable sur OpenStreetMap (" + (loc.notes.join(" ; ") || "aucune correspondance") + ")");
+  if (filtres.length && zone) {
     try {
-      const g = await geocoderZone(zone, fetchImpl, options.delaiNominatim);
-      if (!g) notes.push("zone introuvable sur OpenStreetMap");
-      else {
-        const q = construireRequeteOverpass(g.bbox, filtres, limite);
-        const els = await appelerOverpass(q, fetchImpl, options.serveursOverpass || OVERPASS);
-        const fiches = dedoublonner(els.map((e) => ficheDepuisOverpass(e, zone)).filter((f) => f.nom));
-        if (fiches.length) return { resultats: fiches.slice(0, limite), methode: "overpass", notes };
-        notes.push("aucun établissement de ce type référencé dans la zone");
-      }
+      const els = await appelerOverpass(construireRequeteOverpass(zone, filtres, limite), fetchImpl, options.serveursOverpass || OVERPASS);
+      const fiches = dedoublonner(els.map((e) => ficheDepuisOverpass(e, ville || gouvernorat)).filter((f) => f.nom));
+      if (fiches.length) return { resultats: fiches.slice(0, limite), methode: "overpass", notes };
+      notes.push("aucun établissement de ce type référencé dans la zone");
     } catch (err) { notes.push("Overpass : " + err.message); }
   }
-  const texte = await rechercheTexteNominatim({ requete, zone, limite }, fetchImpl, options.delaiNominatim);
-  return { resultats: dedoublonner(texte), methode: "texte", notes };
+  for (const [nomService, f] of [["Photon", () => rechercheTextePhoton({ requete, zoneTexte, zone, limite }, fetchImpl)],
+                                 ["Nominatim", () => rechercheTexteNominatim({ requete, zoneTexte, limite }, fetchImpl, options.delaiNominatim)]]) {
+    try {
+      const res = dedoublonner(await f());
+      if (res.length) return { resultats: res.slice(0, limite), methode: "texte", notes };
+    } catch (err) { notes.push(nomService + " : " + err.message); }
+  }
+  return { resultats: [], methode: "aucune", notes };
 }
 
 // ===================== Prospection (recherche d'entreprises, mise à jour, analyse IA) =====================
@@ -605,7 +675,8 @@ app.post("/api/prospection/recherche", limiteurIP("recherche de prospects", 30),
         }
       }
     }
-    const o = await rechercheOSM({ requete, zone: zoneTexte, osm: req.body && req.body.osm, limite });
+    const portee = (req.body && req.body.portee) === "gouvernorat" ? "gouvernorat" : "ville";
+    const o = await rechercheOSM({ requete, ville, gouvernorat, portee, osm: req.body && req.body.osm, limite });
     res.json({ ok: true, source: "OpenStreetMap", moteurUtilise: "osm", methodeOsm: o.methode, notes: o.notes, avertissement, resultats: o.resultats });
   } catch (err) {
     console.error("Erreur /api/prospection/recherche :", err);
@@ -627,12 +698,18 @@ app.post("/api/prospection/test", limiteurIP("test de prospection", 20), verifie
       resultat.google.message = r.ok ? "Clé valide, Places API (New) active." : ((j.error && j.error.message) || ("Erreur " + r.status));
     } catch (err) { resultat.google.message = err.message; }
   } else resultat.google.message = "Aucune clé GOOGLE_PLACES_API_KEY sur le serveur.";
-  try {
-    const g = await geocoderZone("Monastir");
-    if (!g) throw new Error("zone de test introuvable");
-    await appelerOverpass('[out:json][timeout:15];node["amenity"="pharmacy"](36.70,10.70,36.75,10.80);out 1;');
-    resultat.osm.ok = true; resultat.osm.message = "Nominatim et Overpass répondent.";
-  } catch (err) { resultat.osm.message = err.message; }
+  const services = [
+    ["Overpass (catégories)", () => appelerOverpass('[out:json][timeout:15];node["amenity"="pharmacy"](35.70,10.75,35.80,10.85);out 1;')],
+    ["Photon (localisation, recherche texte)", async () => { const z = await localiserParPhoton("Monastir", fetch); if (!z) throw new Error("aucune réponse"); }],
+    ["Nominatim (secours)", async () => { const z = await localiserParNominatim("Monastir", fetch); if (!z) throw new Error("aucune réponse"); }],
+  ];
+  resultat.osm.details = [];
+  for (const [nom, f] of services) {
+    try { await f(); resultat.osm.details.push({ nom, ok: true, message: "répond" }); }
+    catch (err) { resultat.osm.details.push({ nom, ok: false, message: err.message }); }
+  }
+  resultat.osm.ok = resultat.osm.details[0].ok && (resultat.osm.details[1].ok || resultat.osm.details[2].ok);
+  resultat.osm.message = resultat.osm.ok ? "Overpass et un géocodeur répondent." : "Recherche OpenStreetMap indisponible depuis le serveur : " + resultat.osm.details.filter(d => !d.ok).map(d => d.nom + " — " + d.message).join(" ; ");
   res.json(resultat);
 });
 app.post("/api/prospection/details", limiteurIP("mise à jour de fiches", 150), verifierAuthIA, quotaJour("places"), async (req, res) => {
