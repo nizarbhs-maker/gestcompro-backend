@@ -413,9 +413,14 @@ function motifNom(nom) {
   return out;
 }
 
-async function appelerOverpass(requete, fetchImpl = fetch, serveurs = OVERPASS) {
+async function appelerOverpass(requete, fetchImpl = fetch, serveurs = OVERPASS, delaiRelance = 2000) {
   let derniereErreur = null;
-  for (const url of serveurs) {
+  // Chaque serveur est essayé deux fois (surcharge passagère fréquente : 429 / 504).
+  const essais = serveurs.flatMap((u) => [u, u]);
+  for (let i = 0; i < essais.length; i++) {
+    const url = essais[i];
+    if (i % 2 === 1 && derniereErreur && /Overpass (429|50\d)/.test(derniereErreur.message)) await pause(delaiRelance);
+    else if (i % 2 === 1) continue;
     try {
       const r = await fetchAvecDelai(fetchImpl, url, {
         method: "POST",
@@ -438,12 +443,11 @@ async function localiserParOverpass(nom, portee, fetchImpl, serveurs) {
   const motif = motifNom(nom);
   if (!motif || motif.length < 3) return null;
   const [s, w, n, e] = BBOX_TUNISIE;
-  const cles = `~"^(name|name:fr|name:en|int_name|alt_name|official_name)$"~"^${motif}$",i`;
+  const variantes = (sel) => ["name:fr", "name", "name:en"].map((k) => `${sel}["${k}"~"^${motif}$",i](${s},${w},${n},${e});`).join("");
   // Gouvernorat (correctif 04/10) : les limites de niveau 4 s'appellent « Gouvernorat de Monastir »,
   // « Monastir Governorate »… — on accepte donc un nom qui CONTIENT le nom saisi, au niveau 4 seulement.
-  const clesGouv = `~"^(name|name:fr|name:en|int_name|official_name)$"~"${motif}",i`;
-  const partieGouv = portee === "gouvernorat" ? `relation["boundary"="administrative"]["admin_level"="4"][${clesGouv}](${s},${w},${n},${e});` : "";
-  const q = `[out:json][timeout:20];(${partieGouv}node["place"~"^(city|town|village|suburb|quarter|neighbourhood|hamlet|locality)$"][${cles}](${s},${w},${n},${e});relation["boundary"="administrative"][${cles}](${s},${w},${n},${e}););out tags center bb 20;`;
+  const partieGouv = portee === "gouvernorat" ? ["name:fr", "name:en"].map((k) => `relation["boundary"="administrative"]["admin_level"="4"]["${k}"~"${motif}",i](${s},${w},${n},${e});`).join("") : "";
+  const q = `[out:json][timeout:25];(${partieGouv}${variantes('node["place"~"^(city|town|village|suburb|quarter|neighbourhood|hamlet|locality)$"]')}${variantes('relation["boundary"="administrative"]')});out tags center bb 20;`;
   const els = await appelerOverpass(q, fetchImpl, serveurs);
   const rels = els.filter((x) => x.type === "relation" && x.bounds);
   const lieux = els.filter((x) => x.type === "node" && x.tags && x.tags.place).sort((a, b) => (RANG_LIEU[a.tags.place] || 9) - (RANG_LIEU[b.tags.place] || 9));
@@ -461,11 +465,11 @@ async function localiserParOverpass(nom, portee, fetchImpl, serveurs) {
 }
 async function localiserParPhoton(zone, fetchImpl) {
   const [s, w, n, e] = BBOX_TUNISIE;
-  const url = `${PHOTON}?q=${encodeURIComponent(zone + " Tunisie")}&limit=1&bbox=${w},${s},${e},${n}`;
+  const url = `${PHOTON}?q=${encodeURIComponent(zone + " Tunisie")}&limit=5&lang=fr&bbox=${w},${s},${e},${n}`;
   const r = await fetchAvecDelai(fetchImpl, url, { headers: { "User-Agent": USER_AGENT } }, 15000);
   if (!r.ok) throw new Error("Photon a répondu " + r.status);
   const j = await r.json();
-  const f = j && Array.isArray(j.features) && j.features[0];
+  const f = j && Array.isArray(j.features) && (j.features.find((x) => x.properties && String(x.properties.countrycode || "").toUpperCase() === "TN") || null);
   if (!f || !f.geometry) return null;
   const [lon, lat] = f.geometry.coordinates;
   const ext = f.properties && f.properties.extent; // [ouest, nord, est, sud]
@@ -526,9 +530,7 @@ function construireRequeteOverpass(zone, filtres, limite = 60) {
   // Correctif 04/10 : beaucoup d'établissements (stations-service, agences) n'ont qu'une enseigne
   // (brand) ou un exploitant, sans « name » : ils étaient écartés. Le filtre « nommé » est appliqué
   // ensuite (nom, enseigne ou exploitant).
-  const lignes = filtres.map((f) => f.valeurs.length
-    ? `nwr["${f.cle}"~"^(${f.valeurs.join("|")})$"](${ou});`
-    : `nwr["${f.cle}"]["name"](${ou});`);
+  const lignes = filtres.map((f) => `nwr${selecteurFiltre(f)}(${ou});`);
   // Le double de la limite : les éléments sans nom ni enseigne sont écartés ensuite.
   return `[out:json][timeout:25];(${lignes.join("")});out center tags ${Math.max(10, Math.min(200, limite * 2))};`;
 }
@@ -557,10 +559,16 @@ function dedoublonner(fiches) {
     vus.add(cle); return true;
   });
 }
-async function rechercheTextePhoton({ requete, zoneTexte, zone, limite }, fetchImpl) {
+// Correctif 04/10 (3) : le repli texte renvoyait des stations de louage et des stations d'Algérie
+// (le rectangle de la Tunisie déborde sur Annaba). Désormais : filtre de catégorie (osm_tag), pays TN
+// seulement, gouvernorat vérifié, distance maximale autour de la zone, noms en français.
+function distanceKm(a, b, c, d) { const r = Math.PI / 180, x = (d - b) * r * Math.cos(((a + c) / 2) * r), y = (c - a) * r; return Math.sqrt(x * x + y * y) * 6371; }
+async function rechercheTextePhoton({ requete, zoneTexte, zone, limite, filtres, gouvernorat, portee }, fetchImpl) {
   const [s, w, n, e] = zone && zone.bbox ? zone.bbox : BBOX_TUNISIE;
   const centre = zone && zone.lat ? `&lat=${zone.lat}&lon=${zone.lon}` : "";
-  const url = `${PHOTON}?q=${encodeURIComponent(requete + " " + zoneTexte)}&limit=${Math.min(40, limite)}&bbox=${w},${s},${e},${n}${centre}`;
+  const tags = (filtres || []).flatMap((f) => f.valeurs.length ? f.valeurs.map((v) => `&osm_tag=${encodeURIComponent(f.cle + ":" + v)}`) : [`&osm_tag=${encodeURIComponent(f.cle)}`]).slice(0, 12).join("");
+  const texte = tags ? zoneTexte : requete + " " + zoneTexte;
+  const url = `${PHOTON}?q=${encodeURIComponent(texte)}&limit=${Math.min(50, limite * 2)}&lang=fr&bbox=${w},${s},${e},${n}${centre}${tags}`;
   const r = await fetchAvecDelai(fetchImpl, url, { headers: { "User-Agent": USER_AGENT } }, 20000);
   if (!r.ok) throw new Error("Photon a répondu " + r.status);
   const j = await r.json();
@@ -571,8 +579,18 @@ async function rechercheTextePhoton({ requete, zoneTexte, zone, limite }, fetchI
       nom: p.name || "", adresse: [[p.housenumber, p.street].filter(Boolean).join(" "), p.city || p.district].filter(Boolean).join(", "),
       ville: p.city || p.district || "", tel: "", siteWeb: "", note: null, nbAvis: null,
       lat: c[1] ?? null, lng: c[0] ?? null, statutGoogle: "",
+      _pays: p.countrycode || "", _region: p.state || "",
     };
-  }).filter((x) => x.nom);
+  }).filter((x) => {
+    if (!x.nom) return false;
+    if (x._pays && x._pays.toUpperCase() !== "TN") return false;
+    if (gouvernorat && x._region && !norm(x._region).includes(norm(gouvernorat)) && !norm(gouvernorat).includes(norm(x._region))) return false;
+    if (zone && zone.lat && x.lat !== null && x.lng !== null) {
+      const max = portee === "gouvernorat" ? 45 : Math.max(6, (zone.rayon || 4000) / 1000 * 1.6);
+      if (distanceKm(zone.lat, zone.lon, x.lat, x.lng) > max) return false;
+    }
+    return true;
+  }).map(({ _pays, _region, ...x }) => x);
 }
 async function rechercheTexteNominatim({ requete, zoneTexte, limite }, fetchImpl, delaiMs) {
   await espacerNominatim(delaiMs);
@@ -588,6 +606,11 @@ async function rechercheTexteNominatim({ requete, zoneTexte, limite }, fetchImpl
     siteWeb: (x.extratags && (x.extratags.website || x.extratags["contact:website"])) || "",
     note: null, nbAvis: null, lat: parseFloat(x.lat) || null, lng: parseFloat(x.lon) || null, statutGoogle: "",
   })).filter((x) => x.nom);
+}
+function selecteurFiltre(f) {
+  if (!f.valeurs.length) return `["${f.cle}"]["name"]`;
+  if (f.valeurs.length === 1) return `["${f.cle}"="${f.valeurs[0]}"]`;
+  return `["${f.cle}"~"^(${f.valeurs.join("|")})$"]`;
 }
 // Codes ISO 3166-2 des gouvernorats (étiquette « ISO3166-2 » des limites administratives OSM).
 const ISO_GOUVERNORATS = {
@@ -606,14 +629,11 @@ async function rechercheGouvernoratParZone(gouvernorat, filtres, limite, fetchIm
   const iso = ISO_GOUVERNORATS[norm(gouvernorat)];
   const motif = motifNom(gouvernorat);
   if (!motif) return null;
-  const zones = [
-    iso ? `area["ISO3166-2"="${iso}"];` : "",
-    `area["boundary"="administrative"]["admin_level"="4"]["name:fr"~"${motif}",i];`,
-    `area["boundary"="administrative"]["admin_level"="4"]["name:en"~"${motif}",i];`,
-  ].join("");
-  const lignes = filtres.map((f) => f.valeurs.length
-    ? `nwr["${f.cle}"~"^(${f.valeurs.join("|")})$"](area.g);`
-    : `nwr["${f.cle}"]["name"](area.g);`);
+  // Correctif 04/10 (3) : la recherche d'une zone par nom parcourt toutes les limites de niveau 4 du
+  // monde (requête lourde → 504). Le code ISO, indexé, est utilisé seul quand il est connu.
+  const zones = iso ? `area["ISO3166-2"="${iso}"];`
+    : `area["boundary"="administrative"]["admin_level"="4"]["name:fr"~"${motif}",i];area["boundary"="administrative"]["admin_level"="4"]["name:en"~"${motif}",i];`;
+  const lignes = filtres.map((f) => `nwr${selecteurFiltre(f)}(area.g);`);
   const q = `[out:json][timeout:60];(${zones})->.g;.g out tags;(${lignes.join("")});out center tags ${Math.max(20, Math.min(400, limite * 3))};`;
   const els = await appelerOverpass(q, fetchImpl, serveurs);
   const aires = els.filter((x) => x.type === "area");
@@ -649,11 +669,11 @@ async function rechercheOSM({ requete, ville, gouvernorat, portee, osm, limite =
       notes.push("aucun établissement de ce type référencé dans la zone");
     } catch (err) { notes.push("Overpass : " + err.message); }
   }
-  for (const [nomService, f] of [["Photon", () => rechercheTextePhoton({ requete, zoneTexte, zone, limite }, fetchImpl)],
+  for (const [nomService, f] of [["Photon", () => rechercheTextePhoton({ requete, zoneTexte, zone, limite, filtres, gouvernorat, portee }, fetchImpl)],
                                  ["Nominatim", () => rechercheTexteNominatim({ requete, zoneTexte, limite }, fetchImpl, options.delaiNominatim)]]) {
     try {
       const res = dedoublonner(await f());
-      if (res.length) return { resultats: res.slice(0, limite), methode: "texte", notes };
+      if (res.length) return { resultats: res.slice(0, limite), methode: "texte", notes, zoneUtilisee: (zone ? zone.nom : zoneTexte) + " (recherche de secours " + nomService + ", moins précise)" };
     } catch (err) { notes.push(nomService + " : " + err.message); }
   }
   return { resultats: [], methode: "aucune", notes };
