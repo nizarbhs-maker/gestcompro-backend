@@ -413,7 +413,7 @@ function motifNom(nom) {
   return out;
 }
 
-async function appelerOverpass(requete, fetchImpl = fetch, serveurs = OVERPASS, delaiRelance = 2000) {
+async function appelerOverpass(requete, fetchImpl = fetch, serveurs = OVERPASS, delaiRelance = 2000, delaiMax = 35000) {
   let derniereErreur = null;
   // Chaque serveur est essayé deux fois (surcharge passagère fréquente : 429 / 504).
   const essais = serveurs.flatMap((u) => [u, u]);
@@ -426,12 +426,12 @@ async function appelerOverpass(requete, fetchImpl = fetch, serveurs = OVERPASS, 
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": USER_AGENT },
         body: "data=" + encodeURIComponent(requete),
-      }, 35000);
+      }, delaiMax);
       if (r.status === 429 || r.status >= 500) { derniereErreur = new Error("Overpass " + r.status); continue; }
       if (!r.ok) throw new Error("Overpass a répondu " + r.status);
       const j = await r.json();
       return Array.isArray(j.elements) ? j.elements : [];
-    } catch (err) { derniereErreur = err; }
+    } catch (err) { derniereErreur = err.name === "AbortError" || /aborted/i.test(err.message) ? new Error("Overpass 504 (délai dépassé)") : err; }
   }
   throw derniereErreur || new Error("Overpass indisponible");
 }
@@ -635,7 +635,7 @@ async function rechercheGouvernoratParZone(gouvernorat, filtres, limite, fetchIm
     : `area["boundary"="administrative"]["admin_level"="4"]["name:fr"~"${motif}",i];area["boundary"="administrative"]["admin_level"="4"]["name:en"~"${motif}",i];`;
   const lignes = filtres.map((f) => `nwr${selecteurFiltre(f)}(area.g);`);
   const q = `[out:json][timeout:60];(${zones})->.g;.g out tags;(${lignes.join("")});out center tags ${Math.max(20, Math.min(400, limite * 3))};`;
-  const els = await appelerOverpass(q, fetchImpl, serveurs);
+  const els = await appelerOverpass(q, fetchImpl, serveurs.slice(0, 2), 2000, 65000);
   const aires = els.filter((x) => x.type === "area");
   if (!aires.length) return null;
   const t = aires[0].tags || {};
