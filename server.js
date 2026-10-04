@@ -4,6 +4,9 @@ import cors from "cors";
 import { GoogleGenAI, Type } from "@google/genai";
 import "dotenv/config";
 
+// Version du serveur : visible sur /api/health et dans Paramètres → Prospection → Tester la connexion.
+const SERVER_VERSION = "2026.10.04.7";
+
 const app = express();
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -212,6 +215,7 @@ app.post("/api/capture", limiteurIP("analyse de document", 20), verifierAuthIA, 
 // (sans jamais révéler la clé elle-même) — utile pour diagnostiquer un déploiement.
 app.get("/api/health", (req, res) => {
   res.json({ ok: true, modele: MODELE, cleConfiguree: !!GEMINI_API_KEY, ttnConfigure: !!(EL_FATOORA_ENDPOINT && SIGNATURE_ENDPOINT),
+    version: SERVER_VERSION,
     placesConfigure: !!process.env.GOOGLE_PLACES_API_KEY,
     moteursProspection: { google: !!process.env.GOOGLE_PLACES_API_KEY, osm: true },
     quotasDuJour: { date: compteursJour.date, gemini: `${compteursJour.gemini}/${PLAFONDS_JOUR.gemini}`, places: `${compteursJour.places}/${PLAFONDS_JOUR.places}` } });
@@ -761,7 +765,7 @@ app.post("/api/prospection/recherche", limiteurIP("recherche de prospects", 30),
 // Test de configuration depuis Paramètres → Prospection. Google : requête « identifiants seuls »
 // (Text Search Essentials, sans coût) ; OpenStreetMap : géocodage de Monastir + requête Overpass minimale.
 app.post("/api/prospection/test", limiteurIP("test de prospection", 20), verifierAuthIA, async (req, res) => {
-  const resultat = { ok: true, google: { configure: !!GOOGLE_PLACES_API_KEY, ok: false, message: "" }, osm: { ok: false, message: "" }, quotasDuJour: { date: compteursJour.date, places: `${compteursJour.places}/${PLAFONDS_JOUR.places}` } };
+  const resultat = { ok: true, version: SERVER_VERSION, google: { configure: !!GOOGLE_PLACES_API_KEY, ok: false, message: "" }, osm: { ok: false, message: "" }, quotasDuJour: { date: compteursJour.date, places: `${compteursJour.places}/${PLAFONDS_JOUR.places}` } };
   if (GOOGLE_PLACES_API_KEY) {
     try {
       const r = await fetch("https://places.googleapis.com/v1/places:searchText", {
