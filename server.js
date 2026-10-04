@@ -589,10 +589,53 @@ async function rechercheTexteNominatim({ requete, zoneTexte, limite }, fetchImpl
     note: null, nbAvis: null, lat: parseFloat(x.lat) || null, lng: parseFloat(x.lon) || null, statutGoogle: "",
   })).filter((x) => x.nom);
 }
+// Codes ISO 3166-2 des gouvernorats (étiquette « ISO3166-2 » des limites administratives OSM).
+const ISO_GOUVERNORATS = {
+  "tunis":"TN-11","ariana":"TN-12","benarous":"TN-13","lamanouba":"TN-14","manouba":"TN-14",
+  "nabeul":"TN-21","zaghouan":"TN-22","bizerte":"TN-23",
+  "beja":"TN-31","jendouba":"TN-32","lekef":"TN-33","kef":"TN-33","siliana":"TN-34",
+  "kairouan":"TN-41","kasserine":"TN-42","sidibouzid":"TN-43",
+  "sousse":"TN-51","monastir":"TN-52","mahdia":"TN-53","sfax":"TN-61",
+  "gafsa":"TN-71","tozeur":"TN-72","kebili":"TN-73",
+  "gabes":"TN-81","medenine":"TN-82","tataouine":"TN-83",
+};
+// Gouvernorat entier (correctif 04/10, 2) : recherche DANS le polygone officiel du gouvernorat
+// (zone Overpass trouvée par code ISO ou par nom de niveau 4), en une seule requête rapide.
+// Renvoie null si la limite n'existe pas dans OpenStreetMap (le calcul habituel prend alors le relais).
+async function rechercheGouvernoratParZone(gouvernorat, filtres, limite, fetchImpl, serveurs) {
+  const iso = ISO_GOUVERNORATS[norm(gouvernorat)];
+  const motif = motifNom(gouvernorat);
+  if (!motif) return null;
+  const zones = [
+    iso ? `area["ISO3166-2"="${iso}"];` : "",
+    `area["boundary"="administrative"]["admin_level"="4"]["name:fr"~"${motif}",i];`,
+    `area["boundary"="administrative"]["admin_level"="4"]["name:en"~"${motif}",i];`,
+  ].join("");
+  const lignes = filtres.map((f) => f.valeurs.length
+    ? `nwr["${f.cle}"~"^(${f.valeurs.join("|")})$"](area.g);`
+    : `nwr["${f.cle}"]["name"](area.g);`);
+  const q = `[out:json][timeout:60];(${zones})->.g;.g out tags;(${lignes.join("")});out center tags ${Math.max(20, Math.min(400, limite * 3))};`;
+  const els = await appelerOverpass(q, fetchImpl, serveurs);
+  const aires = els.filter((x) => x.type === "area");
+  if (!aires.length) return null;
+  const t = aires[0].tags || {};
+  return { elements: els.filter((x) => x.type !== "area"), libelle: t["name:fr"] || t.name || ("Gouvernorat de " + gouvernorat) };
+}
+
 // Point d'entrée. Ne lève jamais d'erreur : en cas de panne générale, renvoie 0 résultat et des notes.
 async function rechercheOSM({ requete, ville, gouvernorat, portee, osm, limite = 40 }, fetchImpl = fetch, options = {}) {
   const filtres = filtresValides(osm);
   const notes = [];
+  if (portee === "gouvernorat" && gouvernorat && filtres.length) {
+    try {
+      const g = await rechercheGouvernoratParZone(gouvernorat, filtres, limite, fetchImpl, options.serveursOverpass || OVERPASS);
+      if (g) {
+        const fiches = dedoublonner(g.elements.map((e) => ficheDepuisOverpass(e, "")).filter((f) => f.nom));
+        if (fiches.length) return { resultats: fiches.slice(0, limite), methode: "overpass", notes, zoneUtilisee: g.libelle + " (limite officielle)" };
+        notes.push("aucun établissement de ce type référencé dans " + g.libelle);
+      } else notes.push("limite du gouvernorat absente d'OpenStreetMap : zone approximative utilisée");
+    } catch (err) { notes.push("Overpass (gouvernorat) : " + err.message); }
+  }
   const zoneTexte = [...new Set([ville, gouvernorat].filter(Boolean))].join(" ");
   const loc = await localiserZone({ ville, gouvernorat, portee }, fetchImpl, options);
   const zone = loc.zone;
@@ -601,7 +644,8 @@ async function rechercheOSM({ requete, ville, gouvernorat, portee, osm, limite =
     try {
       const els = await appelerOverpass(construireRequeteOverpass(zone, filtres, limite), fetchImpl, options.serveursOverpass || OVERPASS);
       const fiches = dedoublonner(els.map((e) => ficheDepuisOverpass(e, portee === "gouvernorat" ? "" : (ville || gouvernorat))).filter((f) => f.nom));
-      if (fiches.length) return { resultats: fiches.slice(0, limite), methode: "overpass", notes };
+      const zoneUtilisee = zone.bbox ? `${zone.nom} (${zone.niveau === "gouvernorat" ? "limite du gouvernorat" : "zone"}, ${zone.source})` : `${zone.nom} (${Math.round((zone.rayon || 4000) / 1000)} km autour, ${zone.source})`;
+      if (fiches.length) return { resultats: fiches.slice(0, limite), methode: "overpass", notes, zoneUtilisee };
       notes.push("aucun établissement de ce type référencé dans la zone");
     } catch (err) { notes.push("Overpass : " + err.message); }
   }
@@ -688,7 +732,7 @@ app.post("/api/prospection/recherche", limiteurIP("recherche de prospects", 30),
     }
     const portee = (req.body && req.body.portee) === "gouvernorat" ? "gouvernorat" : "ville";
     const o = await rechercheOSM({ requete, ville, gouvernorat, portee, osm: req.body && req.body.osm, limite });
-    res.json({ ok: true, source: "OpenStreetMap", moteurUtilise: "osm", methodeOsm: o.methode, notes: o.notes, avertissement, resultats: o.resultats });
+    res.json({ ok: true, source: "OpenStreetMap", moteurUtilise: "osm", methodeOsm: o.methode, zoneUtilisee: o.zoneUtilisee || "", notes: o.notes, avertissement, resultats: o.resultats });
   } catch (err) {
     console.error("Erreur /api/prospection/recherche :", err);
     res.status(500).json({ ok: false, message: "Erreur de recherche : " + err.message });
