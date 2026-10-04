@@ -1,0 +1,20 @@
+{
+  "name": "gestcompro-ia-backend",
+  "version": "1.0.0",
+  "description": "Backend GestComPro — extraction de documents par IA (Gemini), prospection (Google Places / OpenStreetMap + analyse IA) et relais de signature/envoi TTN (facturation électronique). Routes : POST /api/capture, GET /api/health, POST /api/ttn/signer-et-envoyer, GET /api/ttn/statut, POST /api/prospection/recherche|test|details|analyse. La synchronisation des données passe par Supabase (voir guides/6_Supabase.md).",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@google/genai": "^0.3.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "multer": "^1.4.5-lts.1"
+  }
+}
