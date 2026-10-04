@@ -439,13 +439,20 @@ async function localiserParOverpass(nom, portee, fetchImpl, serveurs) {
   if (!motif || motif.length < 3) return null;
   const [s, w, n, e] = BBOX_TUNISIE;
   const cles = `~"^(name|name:fr|name:en|int_name|alt_name|official_name)$"~"^${motif}$",i`;
-  const q = `[out:json][timeout:20];(node["place"~"^(city|town|village|suburb|quarter|neighbourhood|hamlet|locality)$"][${cles}](${s},${w},${n},${e});relation["boundary"="administrative"][${cles}](${s},${w},${n},${e}););out tags center bb 20;`;
+  // Gouvernorat (correctif 04/10) : les limites de niveau 4 s'appellent « Gouvernorat de Monastir »,
+  // « Monastir Governorate »… — on accepte donc un nom qui CONTIENT le nom saisi, au niveau 4 seulement.
+  const clesGouv = `~"^(name|name:fr|name:en|int_name|official_name)$"~"${motif}",i`;
+  const partieGouv = portee === "gouvernorat" ? `relation["boundary"="administrative"]["admin_level"="4"][${clesGouv}](${s},${w},${n},${e});` : "";
+  const q = `[out:json][timeout:20];(${partieGouv}node["place"~"^(city|town|village|suburb|quarter|neighbourhood|hamlet|locality)$"][${cles}](${s},${w},${n},${e});relation["boundary"="administrative"][${cles}](${s},${w},${n},${e}););out tags center bb 20;`;
   const els = await appelerOverpass(q, fetchImpl, serveurs);
   const rels = els.filter((x) => x.type === "relation" && x.bounds);
   const lieux = els.filter((x) => x.type === "node" && x.tags && x.tags.place).sort((a, b) => (RANG_LIEU[a.tags.place] || 9) - (RANG_LIEU[b.tags.place] || 9));
   if (portee === "gouvernorat") {
-    const r = rels.sort((a, b) => (Number(a.tags.admin_level) || 9) - (Number(b.tags.admin_level) || 9))[0];
-    if (r) return { bbox: [r.bounds.minlat, r.bounds.minlon, r.bounds.maxlat, r.bounds.maxlon], nom, source: "Overpass" };
+    const r = rels.filter((x) => String(x.tags.admin_level) === "4")[0];
+    if (r) return { bbox: [r.bounds.minlat, r.bounds.minlon, r.bounds.maxlat, r.bounds.maxlon], nom, source: "Overpass", niveau: "gouvernorat" };
+    // Pas de limite de gouvernorat trouvée : grande zone autour du chef-lieu plutôt que la seule commune
+    const p = lieux[0];
+    if (p) return { lat: p.lat, lon: p.lon, rayon: 30000, nom, source: "Overpass", niveau: "approx" };
   }
   if (lieux.length) { const p = lieux[0]; return { lat: p.lat, lon: p.lon, rayon: RAYON_LIEU[p.tags.place] || 4000, nom, source: "Overpass" }; }
   const r = rels.sort((a, b) => (Number(b.tags.admin_level) || 0) - (Number(a.tags.admin_level) || 0))[0];
@@ -516,10 +523,14 @@ function filtresValides(osm) {
 function construireRequeteOverpass(zone, filtres, limite = 60) {
   const ou = zone.bbox ? zone.bbox.map((v) => Number(v).toFixed(5)).join(",")
     : `around:${Math.round(zone.rayon || 4000)},${Number(zone.lat).toFixed(5)},${Number(zone.lon).toFixed(5)}`;
+  // Correctif 04/10 : beaucoup d'établissements (stations-service, agences) n'ont qu'une enseigne
+  // (brand) ou un exploitant, sans « name » : ils étaient écartés. Le filtre « nommé » est appliqué
+  // ensuite (nom, enseigne ou exploitant).
   const lignes = filtres.map((f) => f.valeurs.length
-    ? `nwr["${f.cle}"~"^(${f.valeurs.join("|")})$"]["name"](${ou});`
+    ? `nwr["${f.cle}"~"^(${f.valeurs.join("|")})$"](${ou});`
     : `nwr["${f.cle}"]["name"](${ou});`);
-  return `[out:json][timeout:25];(${lignes.join("")});out center tags ${Math.max(5, Math.min(200, limite))};`;
+  // Le double de la limite : les éléments sans nom ni enseigne sont écartés ensuite.
+  return `[out:json][timeout:25];(${lignes.join("")});out center tags ${Math.max(10, Math.min(200, limite * 2))};`;
 }
 function ficheDepuisOverpass(el, villeParDefaut = "") {
   const t = el.tags || {};
@@ -529,7 +540,7 @@ function ficheDepuisOverpass(el, villeParDefaut = "") {
   const lon = el.lon ?? (el.center && el.center.lon) ?? null;
   return {
     placeId: "", osmId: el.type && el.id ? `${el.type}/${el.id}` : "",
-    nom: t["name:fr"] || t.name || "",
+    nom: t["name:fr"] || t.name || [t.brand, t.operator && t.operator !== t.brand ? t.operator : ""].filter(Boolean).join(" — ") || "",
     adresse, ville: t["addr:city"] || t["addr:town"] || t["addr:village"] || villeParDefaut,
     tel: t.phone || t["contact:phone"] || t.mobile || t["contact:mobile"] || "",
     siteWeb: t.website || t["contact:website"] || "",
@@ -589,7 +600,7 @@ async function rechercheOSM({ requete, ville, gouvernorat, portee, osm, limite =
   if (filtres.length && zone) {
     try {
       const els = await appelerOverpass(construireRequeteOverpass(zone, filtres, limite), fetchImpl, options.serveursOverpass || OVERPASS);
-      const fiches = dedoublonner(els.map((e) => ficheDepuisOverpass(e, ville || gouvernorat)).filter((f) => f.nom));
+      const fiches = dedoublonner(els.map((e) => ficheDepuisOverpass(e, portee === "gouvernorat" ? "" : (ville || gouvernorat))).filter((f) => f.nom));
       if (fiches.length) return { resultats: fiches.slice(0, limite), methode: "overpass", notes };
       notes.push("aucun établissement de ce type référencé dans la zone");
     } catch (err) { notes.push("Overpass : " + err.message); }
