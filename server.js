@@ -108,9 +108,9 @@ app.use("/api", limiterDebit(30)); // 30 requêtes/minute/IP sur toutes les rout
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const MODELE = process.env.GEMINI_MODEL || "gemini-2.5-flash";
-// Modèle des recherches web (entreprises, téléphone). Séparé de GEMINI_MODEL : la recherche Google intégrée
-// n'est gratuite que sur certains modèles (gemini-2.5-flash au 05/10/2026), sans toucher à la Lecture IA.
-const MODELE_RECHERCHE = process.env.GEMINI_MODEL_RECHERCHE || "gemini-2.5-flash";
+// Modèle des recherches web (entreprises, téléphone) : le même que GEMINI_MODEL, sauf si GEMINI_MODEL_RECHERCHE
+// est défini. Avec Gemini 3.x, la recherche Google intégrée exige la facturation Gemini (non incluse en gratuit).
+const MODELE_RECHERCHE = process.env.GEMINI_MODEL_RECHERCHE || MODELE;
 if (!GEMINI_API_KEY) {
   console.warn("⚠️  GEMINI_API_KEY absente des variables d'environnement — /api/capture échouera tant qu'elle n'est pas définie.");
 }
@@ -706,7 +706,7 @@ async function geminiRechercheWeb(prompt) {
   const j = await r.json().catch(() => ({}));
   if (!r.ok) {
     const msg = (j.error && j.error.message) || ("erreur " + r.status);
-    if (r.status === 429) throw new Error(`Gemini : quota de recherche Google épuisé pour le modèle ${MODELE_RECHERCHE} (gratuit limité par jour). Réessayez demain, ou changez GEMINI_MODEL_RECHERCHE sur Render. Détail : ${msg.slice(0, 160)}`);
+    if (r.status === 429) throw new Error(`Gemini : recherche Google refusée pour le modèle ${MODELE_RECHERCHE} — non incluse dans la formule gratuite (Gemini 3.x) ou quota épuisé. Activez la facturation Gemini. Détail : ${msg.slice(0, 160)}`);
     if (r.status === 404) throw new Error(`Gemini : modèle ${MODELE_RECHERCHE} introuvable. Indiquez un modèle valide dans GEMINI_MODEL_RECHERCHE sur Render.`);
     throw new Error("Gemini : " + msg);
   }
