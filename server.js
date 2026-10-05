@@ -62,11 +62,12 @@ function limiteurIP(nom, max, fenetreMin = 10) {
 const PLAFONDS_JOUR = {
   gemini: parseInt(process.env.IA_MAX_APPELS_JOUR || "300", 10),
   places: parseInt(process.env.PLACES_MAX_APPELS_JOUR || "300", 10),
+  telia: parseInt(process.env.TEL_IA_MAX_APPELS_JOUR || "100", 10), // recherche de téléphone par Gemini + Google Search
 };
-const compteursJour = { date: "", gemini: 0, places: 0 };
+const compteursJour = { date: "", gemini: 0, places: 0, telia: 0 };
 function consommerQuota(type) {
   const jour = new Date().toISOString().slice(0, 10);
-  if (compteursJour.date !== jour) { compteursJour.date = jour; compteursJour.gemini = 0; compteursJour.places = 0; }
+  if (compteursJour.date !== jour) { compteursJour.date = jour; Object.keys(PLAFONDS_JOUR).forEach(k => { compteursJour[k] = 0; }); }
   if (compteursJour[type] >= PLAFONDS_JOUR[type]) return false;
   compteursJour[type]++;
   return true;
@@ -847,6 +848,56 @@ Règles :
   } catch (err) {
     console.error("Erreur /api/prospection/analyse :", err);
     res.status(500).json({ ok: false, message: "Échec de l'analyse IA : " + (err && err.message ? err.message : "erreur inconnue") });
+  }
+});
+
+// ---------- Téléphone d'un prospect par Gemini + recherche Google (gratuit dans le quota Gemini, sans carte) ----------
+// Appel REST direct (indépendant de la version du SDK). Le numéro proposé DOIT être vérifié par l'utilisateur :
+// l'application ne l'enregistre qu'après confirmation.
+function telTunisien(v) {
+  let d = String(v || "").replace(/\D/g, "");
+  if (d.startsWith("00216")) d = d.slice(5); else if (d.startsWith("216") && d.length === 11) d = d.slice(3);
+  if (d.length !== 8 || /^[01]/.test(d)) return "";
+  return "+216 " + d.slice(0, 2) + " " + d.slice(2, 5) + " " + d.slice(5);
+}
+app.post("/api/prospection/telephone", limiteurIP("recherche de téléphone", 30), verifierAuthIA, quotaJour("telia"), async (req, res) => {
+  try {
+    if (!GEMINI_API_KEY) return res.status(500).json({ ok: false, message: "GEMINI_API_KEY non configurée côté serveur." });
+    const b = req.body || {};
+    const nom = String(b.nom || "").trim().slice(0, 150);
+    if (!nom) return res.status(400).json({ ok: false, message: "Nom du prospect manquant." });
+    const lieu = [b.adresse, b.ville, b.gouvernorat].map(x => String(x || "").trim()).filter(Boolean).join(", ").slice(0, 200) || "Tunisie";
+    const prompt = `Recherche sur le web le numéro de téléphone de cet établissement en Tunisie.
+Établissement : ${nom}
+Lieu : ${lieu}
+Règles strictes :
+- Ne donne un numéro que s'il est publié dans une source trouvée (fiche Google, site officiel, page Facebook, annuaire) ET que cette source correspond bien à cet établissement et à ce lieu.
+- N'invente jamais un numéro. En cas de doute ou d'homonyme dans une autre ville, réponds avec "telephone": "".
+Réponds UNIQUEMENT par un objet JSON, sans texte autour :
+{"telephone":"","autres":[],"source":"nom du site ou de la page","confiance":"haute|moyenne|faible","remarque":"1 phrase"}`;
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(MODELE)}:generateContent`;
+    const r = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY },
+      body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: prompt }] }], tools: [{ google_search: {} }], generationConfig: { temperature: 0.1 } }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) return res.status(502).json({ ok: false, message: "Gemini : " + ((j.error && j.error.message) || ("erreur " + r.status)) });
+    const cand = (j.candidates || [])[0] || {};
+    const texte = ((cand.content && cand.content.parts) || []).map(x => x.text || "").join("");
+    const sources = (((cand.groundingMetadata || {}).groundingChunks) || []).map(c => c.web && { titre: c.web.title || "", url: c.web.uri || "" }).filter(Boolean).slice(0, 5);
+    let d = {};
+    const m = texte.match(/\{[\s\S]*\}/);
+    if (m) { try { d = JSON.parse(m[0]); } catch (e) { d = {}; } }
+    const telephone = telTunisien(d.telephone);
+    const autres = [...new Set((Array.isArray(d.autres) ? d.autres : []).map(telTunisien).filter(t => t && t !== telephone))].slice(0, 3);
+    let confiance = ["haute", "moyenne", "faible"].includes(d.confiance) ? d.confiance : "faible";
+    if (!sources.length) confiance = "faible"; // aucune recherche web réellement effectuée
+    res.json({ ok: true, telephone, autres, source: String(d.source || "").slice(0, 150), confiance,
+      remarque: String(d.remarque || "").slice(0, 300), sources, rechercheWeb: sources.length > 0 });
+  } catch (err) {
+    console.error("Erreur /api/prospection/telephone :", err);
+    res.status(500).json({ ok: false, message: "Échec de la recherche du téléphone : " + (err && err.message ? err.message : "erreur inconnue") });
   }
 });
 
