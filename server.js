@@ -108,6 +108,9 @@ app.use("/api", limiterDebit(30)); // 30 requêtes/minute/IP sur toutes les rout
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const MODELE = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+// Modèle des recherches web (entreprises, téléphone). Séparé de GEMINI_MODEL : la recherche Google intégrée
+// n'est gratuite que sur certains modèles (gemini-2.5-flash au 05/10/2026), sans toucher à la Lecture IA.
+const MODELE_RECHERCHE = process.env.GEMINI_MODEL_RECHERCHE || "gemini-2.5-flash";
 if (!GEMINI_API_KEY) {
   console.warn("⚠️  GEMINI_API_KEY absente des variables d'environnement — /api/capture échouera tant qu'elle n'est pas définie.");
 }
@@ -694,14 +697,19 @@ const CHAMPS_PLACE = "id,displayName,formattedAddress,nationalPhoneNumber,intern
 // ---------- Gemini + recherche Google (gratuit dans le quota Gemini, sans carte bancaire) ----------
 // Appel REST direct (indépendant de la version du SDK). Renvoie le texte et les sources web consultées.
 async function geminiRechercheWeb(prompt) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(MODELE)}:generateContent`;
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(MODELE_RECHERCHE)}:generateContent`;
   const r = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY },
     body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: prompt }] }], tools: [{ google_search: {} }], generationConfig: { temperature: 0.1 } }),
   });
   const j = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error("Gemini : " + ((j.error && j.error.message) || ("erreur " + r.status)));
+  if (!r.ok) {
+    const msg = (j.error && j.error.message) || ("erreur " + r.status);
+    if (r.status === 429) throw new Error(`Gemini : quota de recherche Google épuisé pour le modèle ${MODELE_RECHERCHE} (gratuit limité par jour). Réessayez demain, ou changez GEMINI_MODEL_RECHERCHE sur Render. Détail : ${msg.slice(0, 160)}`);
+    if (r.status === 404) throw new Error(`Gemini : modèle ${MODELE_RECHERCHE} introuvable. Indiquez un modèle valide dans GEMINI_MODEL_RECHERCHE sur Render.`);
+    throw new Error("Gemini : " + msg);
+  }
   const cand = (j.candidates || [])[0] || {};
   const texte = ((cand.content && cand.content.parts) || []).map(x => x.text || "").join("");
   const sources = (((cand.groundingMetadata || {}).groundingChunks) || []).map(c => c.web && { titre: c.web.title || "", url: c.web.uri || "" }).filter(Boolean);
