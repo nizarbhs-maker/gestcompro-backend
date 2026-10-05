@@ -63,8 +63,9 @@ const PLAFONDS_JOUR = {
   gemini: parseInt(process.env.IA_MAX_APPELS_JOUR || "300", 10),
   places: parseInt(process.env.PLACES_MAX_APPELS_JOUR || "300", 10),
   telia: parseInt(process.env.TEL_IA_MAX_APPELS_JOUR || "100", 10), // recherche de téléphone par Gemini + Google Search
+  rechia: parseInt(process.env.RECH_IA_MAX_APPELS_JOUR || "50", 10), // recherche d'entreprises par Gemini + Google Search
 };
-const compteursJour = { date: "", gemini: 0, places: 0, telia: 0 };
+const compteursJour = { date: "", gemini: 0, places: 0, telia: 0, rechia: 0 };
 function consommerQuota(type) {
   const jour = new Date().toISOString().slice(0, 10);
   if (compteursJour.date !== jour) { compteursJour.date = jour; Object.keys(PLAFONDS_JOUR).forEach(k => { compteursJour[k] = 0; }); }
@@ -690,6 +691,52 @@ async function rechercheOSM({ requete, ville, gouvernorat, portee, osm, limite =
 // est définie, sinon repli gratuit sur OpenStreetMap (Nominatim) — moins complet, souvent sans téléphone.
 const GOOGLE_PLACES_API_KEY = process.env.GOOGLE_PLACES_API_KEY || "";
 const CHAMPS_PLACE = "id,displayName,formattedAddress,nationalPhoneNumber,internationalPhoneNumber,location,rating,userRatingCount,websiteUri,businessStatus";
+// ---------- Gemini + recherche Google (gratuit dans le quota Gemini, sans carte bancaire) ----------
+// Appel REST direct (indépendant de la version du SDK). Renvoie le texte et les sources web consultées.
+async function geminiRechercheWeb(prompt) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(MODELE)}:generateContent`;
+  const r = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY },
+    body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: prompt }] }], tools: [{ google_search: {} }], generationConfig: { temperature: 0.1 } }),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error("Gemini : " + ((j.error && j.error.message) || ("erreur " + r.status)));
+  const cand = (j.candidates || [])[0] || {};
+  const texte = ((cand.content && cand.content.parts) || []).map(x => x.text || "").join("");
+  const sources = (((cand.groundingMetadata || {}).groundingChunks) || []).map(c => c.web && { titre: c.web.title || "", url: c.web.uri || "" }).filter(Boolean);
+  return { texte, sources };
+}
+// Liste d'entreprises trouvée par Gemini + Google Search. Résultats à vérifier : signalé à l'utilisateur.
+async function rechercheGemini({ requete, ville, gouvernorat, portee, limite }) {
+  const zone = portee === "gouvernorat" ? `gouvernorat de ${gouvernorat || ville}` : `${ville || gouvernorat}${gouvernorat && gouvernorat !== ville ? " (gouvernorat de " + gouvernorat + ")" : ""}`;
+  const n = Math.max(5, Math.min(20, limite || 20));
+  const prompt = `Recherche sur le web (Google) des établissements réels correspondant à « ${requete} » situés à ${zone}, en Tunisie.
+Donne au maximum ${n} établissements différents, uniquement s'ils existent réellement et sont bien situés dans cette zone (pas dans une autre ville).
+Pour chacun : nom exact, adresse (rue ou quartier si connue), ville, téléphone publié s'il est trouvé (sinon ""), source (site, page Facebook, annuaire, fiche Google).
+N'invente jamais un établissement ni un numéro. Mieux vaut une liste courte et juste.
+Réponds UNIQUEMENT par un tableau JSON, sans texte autour :
+[{"nom":"","adresse":"","ville":"","telephone":"","source":""}]`;
+  const { texte, sources } = await geminiRechercheWeb(prompt);
+  const m = texte.match(/\[[\s\S]*\]/);
+  let liste = [];
+  if (m) { try { liste = JSON.parse(m[0]); } catch (e) { liste = []; } }
+  const vus = new Set(), resultats = [];
+  for (const x of Array.isArray(liste) ? liste : []) {
+    const nom = String((x && x.nom) || "").trim().slice(0, 150);
+    const cle = nom.toLowerCase().replace(/\s+/g, " ");
+    if (!nom || vus.has(cle)) continue;
+    vus.add(cle);
+    resultats.push({ placeId: "", nom, adresse: String(x.adresse || "").trim().slice(0, 200), ville: String(x.ville || "").trim().slice(0, 80),
+      tel: telTunisien(x.telephone), siteWeb: "", note: null, nbAvis: null, lat: null, lng: null, statutGoogle: "",
+      sourceIA: String(x.source || "").trim().slice(0, 150) || "IA" });
+    if (resultats.length >= n) break;
+  }
+  const avertissement = !sources.length
+    ? "Gemini n'a pas effectué de recherche web : liste peu fiable, vérifiez chaque entreprise."
+    : "Liste trouvée par IA (Gemini + Google) : vérifiez chaque entreprise et chaque numéro avant de l'utiliser.";
+  return { resultats, avertissement, sources: sources.length };
+}
 function ficheDepuisPlace(pl) {
   return {
     placeId: pl.id || "",
@@ -733,10 +780,16 @@ app.post("/api/prospection/recherche", limiteurIP("recherche de prospects", 30),
     const ville = nettoyerTexte(req.body && req.body.ville, 80);
     const gouvernorat = nettoyerTexte(req.body && req.body.gouvernorat, 60);
     const limite = Math.max(5, Math.min(60, parseInt(req.body && req.body.limite, 10) || 20));
-    const moteur = ["auto", "google", "osm"].includes(req.body && req.body.moteur) ? req.body.moteur : "auto";
+    const moteur = ["auto", "google", "osm", "gemini"].includes(req.body && req.body.moteur) ? req.body.moteur : "auto";
     if (!requete || (!ville && !gouvernorat)) return res.status(400).json({ ok: false, message: "Requête et zone (ville ou gouvernorat) obligatoires." });
     const zoneTexte = [...new Set([ville, gouvernorat].filter(Boolean))].join(" ");
     let avertissement = "";
+    if (moteur === "gemini") {
+      if (!GEMINI_API_KEY) return res.status(400).json({ ok: false, message: "GEMINI_API_KEY non configurée côté serveur." });
+      if (!consommerQuota("rechia")) return res.status(429).json({ ok: false, message: `Plafond journalier de recherches IA atteint (${PLAFONDS_JOUR.rechia}). Réessayez demain ou utilisez OpenStreetMap.` });
+      const g = await rechercheGemini({ requete, ville, gouvernorat, portee: (req.body && req.body.portee) === "gouvernorat" ? "gouvernorat" : "ville", limite });
+      return res.json({ ok: true, source: "Google via Gemini (IA)", moteurUtilise: "gemini", avertissement: g.avertissement, resultats: g.resultats });
+    }
     if (moteur === "google" && !GOOGLE_PLACES_API_KEY) {
       return res.status(400).json({ ok: false, message: "Google Places n'est pas configuré sur le serveur (variable GOOGLE_PLACES_API_KEY). Choisissez OpenStreetMap ou ajoutez la clé (Paramètres → Prospection → guide Google Places)." });
     }
@@ -875,17 +928,9 @@ Règles strictes :
 - N'invente jamais un numéro. En cas de doute ou d'homonyme dans une autre ville, réponds avec "telephone": "".
 Réponds UNIQUEMENT par un objet JSON, sans texte autour :
 {"telephone":"","autres":[],"source":"nom du site ou de la page","confiance":"haute|moyenne|faible","remarque":"1 phrase"}`;
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(MODELE)}:generateContent`;
-    const r = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY },
-      body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: prompt }] }], tools: [{ google_search: {} }], generationConfig: { temperature: 0.1 } }),
-    });
-    const j = await r.json().catch(() => ({}));
-    if (!r.ok) return res.status(502).json({ ok: false, message: "Gemini : " + ((j.error && j.error.message) || ("erreur " + r.status)) });
-    const cand = (j.candidates || [])[0] || {};
-    const texte = ((cand.content && cand.content.parts) || []).map(x => x.text || "").join("");
-    const sources = (((cand.groundingMetadata || {}).groundingChunks) || []).map(c => c.web && { titre: c.web.title || "", url: c.web.uri || "" }).filter(Boolean).slice(0, 5);
+    const w = await geminiRechercheWeb(prompt);
+    const texte = w.texte;
+    const sources = w.sources.slice(0, 5);
     let d = {};
     const m = texte.match(/\{[\s\S]*\}/);
     if (m) { try { d = JSON.parse(m[0]); } catch (e) { d = {}; } }
@@ -897,7 +942,7 @@ Réponds UNIQUEMENT par un objet JSON, sans texte autour :
       remarque: String(d.remarque || "").slice(0, 300), sources, rechercheWeb: sources.length > 0 });
   } catch (err) {
     console.error("Erreur /api/prospection/telephone :", err);
-    res.status(500).json({ ok: false, message: "Échec de la recherche du téléphone : " + (err && err.message ? err.message : "erreur inconnue") });
+    res.status(/^Gemini/.test(err && err.message) ? 502 : 500).json({ ok: false, message: "Échec de la recherche du téléphone : " + (err && err.message ? err.message : "erreur inconnue") });
   }
 });
 
