@@ -24,7 +24,7 @@ if (!ALLOWED_ORIGIN) {
 app.use(cors(ALLOWED_ORIGIN ? { origin: ALLOWED_ORIGIN } : {}));
 // Cross-Origin-Resource-Policy (audit du 26/09) : depuis que le frontend charge en isolation
 // stricte (Cross-Origin-Opener-Policy/Cross-Origin-Embedder-Policy, requis par SQLite Wasm/OPFS —
-// voir netlify.toml), le navigateur peut bloquer ses propres appels fetch() vers CE serveur si les
+// voir _headers de l'app), le navigateur peut bloquer ses propres appels fetch() vers CE serveur si les
 // réponses ne portent pas explicitement cet en-tête, même quand CORS est déjà correctement
 // configuré ci-dessus. Sans lui : risque réel que /api/capture, /api/ttn/* et /api/prospection cessent de
 // répondre au frontend dès que l'isolation est activée côté navigateur — jamais vérifié en
@@ -823,35 +823,6 @@ app.post("/api/prospection/recherche", limiteurIP("recherche de prospects", 30),
     console.error("Erreur /api/prospection/recherche :", err);
     res.status(500).json({ ok: false, message: "Erreur de recherche : " + err.message });
   }
-});
-// Test de configuration depuis Paramètres → Prospection. Google : requête « identifiants seuls »
-// (Text Search Essentials, sans coût) ; OpenStreetMap : géocodage de Monastir + requête Overpass minimale.
-app.post("/api/prospection/test", limiteurIP("test de prospection", 20), verifierAuthIA, async (req, res) => {
-  const resultat = { ok: true, version: SERVER_VERSION, google: { configure: !!GOOGLE_PLACES_API_KEY, ok: false, message: "" }, osm: { ok: false, message: "" }, quotasDuJour: { date: compteursJour.date, places: `${compteursJour.places}/${PLAFONDS_JOUR.places}` } };
-  if (GOOGLE_PLACES_API_KEY) {
-    try {
-      const r = await fetch("https://places.googleapis.com/v1/places:searchText", {
-        method: "POST", headers: { "Content-Type": "application/json", "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY, "X-Goog-FieldMask": "places.id" },
-        body: JSON.stringify({ textQuery: "pharmacie Monastir Tunisie", languageCode: "fr", regionCode: "TN", pageSize: 1 }),
-      });
-      const j = await r.json();
-      resultat.google.ok = r.ok;
-      resultat.google.message = r.ok ? "Clé valide, Places API (New) active." : ((j.error && j.error.message) || ("Erreur " + r.status));
-    } catch (err) { resultat.google.message = err.message; }
-  } else resultat.google.message = "Aucune clé GOOGLE_PLACES_API_KEY sur le serveur.";
-  const services = [
-    ["Overpass (catégories)", () => appelerOverpass('[out:json][timeout:15];node["amenity"="pharmacy"](35.70,10.75,35.80,10.85);out 1;')],
-    ["Photon (localisation, recherche texte)", async () => { const z = await localiserParPhoton("Monastir", fetch); if (!z) throw new Error("aucune réponse"); }],
-    ["Nominatim (secours)", async () => { const z = await localiserParNominatim("Monastir", fetch); if (!z) throw new Error("aucune réponse"); }],
-  ];
-  resultat.osm.details = [];
-  for (const [nom, f] of services) {
-    try { await f(); resultat.osm.details.push({ nom, ok: true, message: "répond" }); }
-    catch (err) { resultat.osm.details.push({ nom, ok: false, message: err.message }); }
-  }
-  resultat.osm.ok = resultat.osm.details[0].ok && (resultat.osm.details[1].ok || resultat.osm.details[2].ok);
-  resultat.osm.message = resultat.osm.ok ? "Overpass et un géocodeur répondent." : "Recherche OpenStreetMap indisponible depuis le serveur : " + resultat.osm.details.filter(d => !d.ok).map(d => d.nom + " — " + d.message).join(" ; ");
-  res.json(resultat);
 });
 app.post("/api/prospection/details", limiteurIP("mise à jour de fiches", 150), verifierAuthIA, quotaJour("places"), async (req, res) => {
   try {
