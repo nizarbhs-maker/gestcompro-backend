@@ -1,11 +1,12 @@
 import express from "express";
 import multer from "multer";
 import cors from "cors";
+import { timingSafeEqual } from "node:crypto";
 import { GoogleGenAI, Type } from "@google/genai";
 import "dotenv/config";
 
 // Version du serveur : visible sur /api/health et dans Paramètres → Prospection → Tester la connexion.
-const SERVER_VERSION = "2026.10.04.7";
+const SERVER_VERSION = "2026.10.08.2";
 
 const app = express();
 const upload = multer({
@@ -31,6 +32,8 @@ app.use(cors(ALLOWED_ORIGIN ? { origin: ALLOWED_ORIGIN } : {}));
 // conditions réelles (pas de navigateur disponible ici), ajouté par précaution plutôt que découvert
 // après coup.
 app.use((req, res, next) => { res.setHeader("Cross-Origin-Resource-Policy", "cross-origin"); next(); });
+// Envoi de documents par e-mail : PDF en base64 (jusqu'à ~8 Mo) → limite élargie sur cette seule route.
+app.use("/api/email", express.json({ limit: "12mb" }));
 app.use(express.json());
 
 // ===================== Limitation des appels (audit du 28/09) =====================
@@ -64,8 +67,9 @@ const PLAFONDS_JOUR = {
   places: parseInt(process.env.PLACES_MAX_APPELS_JOUR || "300", 10),
   telia: parseInt(process.env.TEL_IA_MAX_APPELS_JOUR || "100", 10), // recherche de téléphone par Gemini + Google Search
   rechia: parseInt(process.env.RECH_IA_MAX_APPELS_JOUR || "50", 10), // recherche d'entreprises par Gemini + Google Search
+  email: parseInt(process.env.EMAIL_MAX_ENVOIS_JOUR || "100", 10), // envoi de documents par e-mail (Gmail : 500/jour max)
 };
-const compteursJour = { date: "", gemini: 0, places: 0, telia: 0, rechia: 0 };
+const compteursJour = { date: "", gemini: 0, places: 0, telia: 0, rechia: 0, email: 0 };
 function consommerQuota(type) {
   const jour = new Date().toISOString().slice(0, 10);
   if (compteursJour.date !== jour) { compteursJour.date = jour; Object.keys(PLAFONDS_JOUR).forEach(k => { compteursJour[k] = 0; }); }
@@ -101,6 +105,7 @@ function limiterDebit(maxParMinute) {
     }
     historique.push(maintenant);
     COMPTEURS_REQUETES.set(ip, historique);
+    if (COMPTEURS_REQUETES.size > 10000) COMPTEURS_REQUETES.clear(); // audit 08/10 : garde-fou mémoire (Map jamais purgée)
     next();
   };
 }
@@ -259,16 +264,22 @@ if (!IA_API_KEY) {
 }
 
 // Authentification applicative interne (PAS un secret TTN) : protège juste l'accès à ce relais.
+// Audit 08/10 : comparaison à temps constant (évite de deviner la clé caractère par caractère).
+function cleEgale(recue, attendue) {
+  if (!attendue || typeof recue !== "string") return false;
+  const a = Buffer.from(recue), b = Buffer.from(attendue);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
 function verifierAuthApplicative(req, res, next) {
   const cle = req.header("X-App-Api-Key");
-  if (!APP_API_KEY || cle !== APP_API_KEY) return res.status(401).json({ ok: false, message: "Non autorisé (X-App-Api-Key manquante ou incorrecte)." });
+  if (!cleEgale(cle, APP_API_KEY)) return res.status(401).json({ ok: false, message: "Non autorisé (X-App-Api-Key manquante ou incorrecte)." });
   next();
 }
 // Authentification dédiée à l'Analyse IA — volontairement séparée de verifierAuthApplicative
 // (TTN) : en-tête distinct, clé distincte, aucune des deux fonctions ne se lit ni ne s'utilise.
 function verifierAuthIA(req, res, next) {
   const cle = req.header("X-Ia-Api-Key");
-  if (!IA_API_KEY || cle !== IA_API_KEY) return res.status(401).json({ ok: false, message: "Non autorisé (X-Ia-Api-Key manquante ou incorrecte)." });
+  if (!cleEgale(cle, IA_API_KEY)) return res.status(401).json({ ok: false, message: "Non autorisé (X-Ia-Api-Key manquante ou incorrecte)." });
   next();
 }
 // Extraction simple par expression régulière plutôt qu'un vrai parseur XML : suffisant pour les
@@ -922,6 +933,46 @@ Réponds UNIQUEMENT par un objet JSON, sans texte autour :
   } catch (err) {
     console.error("Erreur /api/prospection/telephone :", err);
     res.status(/^Gemini/.test(err && err.message) ? 502 : 500).json({ ok: false, message: "Échec de la recherche du téléphone : " + (err && err.message ? err.message : "erreur inconnue") });
+  }
+});
+
+// ---------- Envoi d'un document client par e-mail (07/10) ----------
+// SMTP gratuit : Gmail avec un « mot de passe d'application » (compte Google avec validation en 2 étapes).
+// Variables Render : SMTP_USER (adresse Gmail), SMTP_PASS (mot de passe d'application, 16 lettres),
+// facultatives : SMTP_HOST (smtp.gmail.com), SMTP_PORT (465), SMTP_NOM (nom affiché), SMTP_REPONSE (Reply-To).
+// Non configuré → 501 : l'application ouvre alors le menu de partage à la place.
+let transporteurMail = null;
+async function obtenirTransporteurMail() {
+  if (transporteurMail) return transporteurMail;
+  const { default: nodemailer } = await import("nodemailer");
+  const port = parseInt(process.env.SMTP_PORT || "465", 10);
+  transporteurMail = nodemailer.createTransport({ host: process.env.SMTP_HOST || "smtp.gmail.com", port, secure: port === 465,
+    auth: { user: process.env.SMTP_USER, pass: String(process.env.SMTP_PASS || "").replace(/\s+/g, "") } });
+  return transporteurMail;
+}
+app.post("/api/email/envoyer", limiteurIP("envoi d'e-mails", 60), verifierAuthIA, async (req, res) => {
+  try {
+    if (!process.env.SMTP_USER || !process.env.SMTP_PASS) return res.status(501).json({ ok: false, message: "Envoi d'e-mails non configuré sur le serveur (SMTP_USER / SMTP_PASS)." });
+    const b = req.body || {};
+    const a = String(b.a || "").trim();
+    if (!/^[^\s@,;]+@[^\s@,;]+\.[^\s@,;]+$/.test(a)) return res.status(400).json({ ok: false, message: "Adresse e-mail du client invalide." });
+    const pdf = String(b.pdfBase64 || "");
+    if (!pdf || pdf.length > 11 * 1024 * 1024) return res.status(400).json({ ok: false, message: "PDF manquant ou trop volumineux (8 Mo max)." });
+    if (!consommerQuota("email")) return res.status(429).json({ ok: false, message: `Plafond journalier d'e-mails atteint (${PLAFONDS_JOUR.email}).` });
+    const nomFichier = (String(b.nomFichier || "document.pdf").replace(/[^\w.\-]/g, "_").slice(0, 80) || "document.pdf").replace(/(\.pdf)?$/i, ".pdf");
+    const t = await obtenirTransporteurMail();
+    const info = await t.sendMail({
+      from: process.env.SMTP_NOM ? `"${String(process.env.SMTP_NOM).replace(/"/g, "")}" <${process.env.SMTP_USER}>` : process.env.SMTP_USER,
+      to: a, replyTo: process.env.SMTP_REPONSE || undefined,
+      subject: String(b.sujet || "Document").slice(0, 200),
+      text: String(b.texte || "").slice(0, 5000),
+      attachments: [{ filename: nomFichier, content: Buffer.from(pdf, "base64"), contentType: "application/pdf" }],
+    });
+    res.json({ ok: true, id: info.messageId || "" });
+  } catch (err) {
+    console.error("Erreur /api/email/envoyer :", err);
+    const m = err && err.code === "EAUTH" ? "Gmail refuse la connexion : vérifiez SMTP_USER et le mot de passe d'application (SMTP_PASS)." : "serveur de messagerie indisponible (détail dans les journaux Render)";
+    res.status(502).json({ ok: false, message: "Échec de l'envoi : " + m });
   }
 });
 
