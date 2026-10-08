@@ -6,7 +6,7 @@ import { GoogleGenAI, Type } from "@google/genai";
 import "dotenv/config";
 
 // Version du serveur : visible sur /api/health et dans Paramètres → Prospection → Tester la connexion.
-const SERVER_VERSION = "2026.10.08.2";
+const SERVER_VERSION = "2026.10.08.4";
 
 const app = express();
 const upload = multer({
@@ -218,6 +218,25 @@ app.post("/api/capture", limiteurIP("analyse de document", 20), verifierAuthIA, 
       success: false,
       error: "Échec de l'analyse IA : " + (err && err.message ? err.message : "erreur inconnue"),
     });
+  }
+});
+
+// Test réel de Gemini (08/10) : petite requête de quelques jetons pour vérifier en une fois la clé
+// IA_API_KEY de l'appareil, la clé GEMINI_API_KEY, le nom du modèle et le quota. Appelé par le Diagnostic.
+app.post("/api/ia/test", limiteurIP("test Gemini", 10), verifierAuthIA, quotaJour("gemini"), async (req, res) => {
+  if (!GEMINI_API_KEY) return res.status(503).json({ ok: false, message: "GEMINI_API_KEY absente sur Render." });
+  const debut = Date.now();
+  try {
+    const r = await ai.models.generateContent({ model: MODELE, contents: "Réponds uniquement par le mot OK." });
+    res.json({ ok: true, modele: MODELE, reponse: String(r.text || "").trim().slice(0, 40), ms: Date.now() - debut });
+  } catch (err) {
+    console.error("Test Gemini :", err);
+    const m = String((err && err.message) || "");
+    const message = /API key not valid|API_KEY_INVALID|PERMISSION_DENIED/i.test(m) ? "Clé GEMINI_API_KEY refusée par Google (invalide ou révoquée)."
+      : /not found|404/i.test(m) ? `Modèle « ${MODELE} » introuvable : corrigez GEMINI_MODEL sur Render.`
+      : /quota|RESOURCE_EXHAUSTED|429/i.test(m) ? "Quota Gemini atteint (gratuit épuisé ou facturation non activée)."
+      : "Gemini indisponible : " + m.slice(0, 160);
+    res.status(502).json({ ok: false, modele: MODELE, message, ms: Date.now() - debut });
   }
 });
 
