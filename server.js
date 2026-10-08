@@ -6,7 +6,7 @@ import { GoogleGenAI, Type } from "@google/genai";
 import "dotenv/config";
 
 // Version du serveur : visible sur /api/health et dans Paramètres → Prospection → Tester la connexion.
-const SERVER_VERSION = "2026.10.08.4";
+const SERVER_VERSION = "2026.10.08.6";
 
 const app = express();
 const upload = multer({
@@ -120,6 +120,23 @@ if (!GEMINI_API_KEY) {
   console.warn("⚠️  GEMINI_API_KEY absente des variables d'environnement — /api/capture échouera tant qu'elle n'est pas définie.");
 }
 const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
+// Surcharge Google (08/10, constaté : 503 « model is currently experiencing high demand ») : 2 nouvelles
+// tentatives espacées, puis modèle de secours si GEMINI_MODEL_SECOURS est défini sur Render
+// (ex. gemini-3.7-flash). Les erreurs de clé ou de modèle introuvable ne sont jamais retentées.
+const MODELE_SECOURS = process.env.GEMINI_MODEL_SECOURS || "";
+
+const erreurTemporaire = (err) => /\b(503|500|429)\b|UNAVAILABLE|overloaded|high demand|RESOURCE_EXHAUSTED|INTERNAL/i.test(String((err && err.message) || err));
+async function genererGemini(params) {
+  let derniere;
+  for (const [modele, delais] of [[params.model, [0, 1500, 4000]], ...(MODELE_SECOURS && MODELE_SECOURS !== params.model ? [[MODELE_SECOURS, [0]]] : [])]) {
+    for (const d of delais) {
+      if (d) await new Promise((ok) => setTimeout(ok, d));
+      try { const r = await ai.models.generateContent({ ...params, model: modele }); r.modeleUtilise = modele; return r; }
+      catch (err) { derniere = err; if (!erreurTemporaire(err)) throw err; console.warn(`Gemini ${modele} indisponible, nouvel essai…`); }
+    }
+  }
+  throw derniere;
+}
 
 /* ===================== Schéma de réponse strict =====================
    IMPORTANT : ce schéma — et les noms de champs qu'il produit — doit rester identique à ce
@@ -200,11 +217,11 @@ app.post("/api/capture", limiteurIP("analyse de document", 20), verifierAuthIA, 
       },
     };
 
-    const response = await ai.models.generateContent({
+    const response = await genererGemini({
       model: MODELE,
       contents: [{ text: promptExtraction }, filePart],
       config: {
-        temperature: 0.1, // légère marge, jamais 0 strict — évite les réponses vides répétées observées sur certains documents ambigus
+        // 08/10 : plus de « temperature » — paramètre déprécié depuis Gemini 3.7 (Google demande de le retirer).
         responseMimeType: "application/json",
         responseSchema: schemaExtraction,
       },
@@ -227,16 +244,17 @@ app.post("/api/ia/test", limiteurIP("test Gemini", 10), verifierAuthIA, quotaJou
   if (!GEMINI_API_KEY) return res.status(503).json({ ok: false, message: "GEMINI_API_KEY absente sur Render." });
   const debut = Date.now();
   try {
-    const r = await ai.models.generateContent({ model: MODELE, contents: "Réponds uniquement par le mot OK." });
-    res.json({ ok: true, modele: MODELE, reponse: String(r.text || "").trim().slice(0, 40), ms: Date.now() - debut });
+    const r = await genererGemini({ model: MODELE, contents: "Réponds uniquement par le mot OK." });
+    res.json({ ok: true, modele: r.modeleUtilise || MODELE, reponse: String(r.text || "").trim().slice(0, 40), ms: Date.now() - debut });
   } catch (err) {
     console.error("Test Gemini :", err);
     const m = String((err && err.message) || "");
     const message = /API key not valid|API_KEY_INVALID|PERMISSION_DENIED/i.test(m) ? "Clé GEMINI_API_KEY refusée par Google (invalide ou révoquée)."
       : /not found|404/i.test(m) ? `Modèle « ${MODELE} » introuvable : corrigez GEMINI_MODEL sur Render.`
+      : /high demand|overloaded|UNAVAILABLE|\b503\b/i.test(m) ? "Google Gemini surchargé en ce moment (temporaire) — clé et modèle corrects."
       : /quota|RESOURCE_EXHAUSTED|429/i.test(m) ? "Quota Gemini atteint (gratuit épuisé ou facturation non activée)."
       : "Gemini indisponible : " + m.slice(0, 160);
-    res.status(502).json({ ok: false, modele: MODELE, message, ms: Date.now() - debut });
+    res.status(502).json({ ok: false, temporaire: erreurTemporaire(err), modele: MODELE, message, ms: Date.now() - debut });
   }
 });
 
@@ -731,7 +749,7 @@ async function geminiRechercheWeb(prompt) {
   const r = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY },
-    body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: prompt }] }], tools: [{ google_search: {} }], generationConfig: { temperature: 0.1 } }),
+    body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: prompt }] }], tools: [{ google_search: {} }] }),
   });
   const j = await r.json().catch(() => ({}));
   if (!r.ok) {
@@ -899,10 +917,10 @@ Règles :
 - Priorité A = petite structure où le patron décide vite ou risque élevé (nuit, espèces, objets de valeur) ; C = grande chaîne dont les fournisseurs sont imposés par le siège.
 - Le message est court, poli (vouvoiement), en français, propose un diagnostic sécurité gratuit sur place, sans prix sauf si l'offre en donne un, et se termine par une question.
 - Si un avis évoque un problème (Wi-Fi faible, vols, portes, sécurité), appuie-toi dessus avec tact sans citer l'avis mot pour mot.`;
-    const response = await ai.models.generateContent({
+    const response = await genererGemini({
       model: MODELE,
       contents: [{ text: prompt }],
-      config: { temperature: 0.4, responseMimeType: "application/json", responseSchema: schemaProspect },
+      config: { responseMimeType: "application/json", responseSchema: schemaProspect },
     });
     const analyse = JSON.parse(response.text);
     if (analyse.message) analyse.message = String(analyse.message).slice(0, 900);
