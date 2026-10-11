@@ -6,7 +6,7 @@ import { GoogleGenAI, Type } from "@google/genai";
 import "dotenv/config";
 
 // Version du serveur : visible sur /api/health et dans Paramètres → Prospection → Tester la connexion.
-const SERVER_VERSION = "2026.10.08.6";
+const SERVER_VERSION = "2026.10.11.1";
 
 const app = express();
 const upload = multer({
@@ -32,9 +32,13 @@ app.use(cors(ALLOWED_ORIGIN ? { origin: ALLOWED_ORIGIN } : {}));
 // conditions réelles (pas de navigateur disponible ici), ajouté par précaution plutôt que découvert
 // après coup.
 app.use((req, res, next) => { res.setHeader("Cross-Origin-Resource-Policy", "cross-origin"); next(); });
-// Envoi de documents par e-mail : PDF en base64 (jusqu'à ~8 Mo) → limite élargie sur cette seule route.
-app.use("/api/email", express.json({ limit: "12mb" }));
-app.use(express.json());
+// Audit 11/10 : on ne s'exposait pas qu'au volume de la route e-mail : son analyseur JSON de 12 Mo
+// s'exécutait AVANT l'authentification et AVANT la limitation d'appels (n'importe qui pouvait forcer
+// l'analyse de 12 Mo). Il est maintenant placé après les deux (voir plus bas) ; ici, l'analyseur standard
+// (100 Ko) ne s'applique plus à cette route.
+app.disable("x-powered-by");
+const jsonStandard = express.json();
+app.use((req, res, next) => (req.path.startsWith("/api/email") ? next() : jsonStandard(req, res, next)));
 
 // ===================== Limitation des appels (audit du 28/09) =====================
 // Deux protections contre une clé d'accès perdue (appareil volé) ou un script malveillant, qui
@@ -88,28 +92,13 @@ function quotaJour(type) {
 // Filet général : toute route /api, 200 requêtes / 10 min par IP (freine aussi les essais de clé).
 app.use("/api", limiteurIP("général", 200));
 app.use("/api/ttn", express.text({ type: "*/*", limit: "5mb" })); // le XML TEIF non signé arrive en corps brut, pas en JSON
+// Envoi de documents par e-mail : PDF en base64 (jusqu'à ~8 Mo) → limite élargie sur cette seule route,
+// et seulement pour un appareil authentifié (clé IA) qui a passé le limiteur ci-dessus.
+app.use("/api/email", verifierAuthIA, express.json({ limit: "12mb" }));
 
-// Limitation de débit minimaliste (sans dépendance externe non vérifiable ici) : compteur glissant en
-// mémoire par IP. Suffisant pour un usage mono-entreprise ; ne survit pas à un redémarrage ni à
-// plusieurs instances du serveur — pour un usage à plus grande échelle, préférer un vrai middleware
-// dédié (express-rate-limit) avec un store partagé (Redis).
-const COMPTEURS_REQUETES = new Map(); // ip -> [timestamps]
-function limiterDebit(maxParMinute) {
-  return (req, res, next) => {
-    const ip = req.ip || req.connection.remoteAddress || "inconnu";
-    const maintenant = Date.now();
-    const fenetre = 60_000;
-    const historique = (COMPTEURS_REQUETES.get(ip) || []).filter(t => maintenant - t < fenetre);
-    if (historique.length >= maxParMinute) {
-      return res.status(429).json({ ok: false, success: false, message: "Trop de requêtes — réessayez dans une minute." });
-    }
-    historique.push(maintenant);
-    COMPTEURS_REQUETES.set(ip, historique);
-    if (COMPTEURS_REQUETES.size > 10000) COMPTEURS_REQUETES.clear(); // audit 08/10 : garde-fou mémoire (Map jamais purgée)
-    next();
-  };
-}
-app.use("/api", limiterDebit(30)); // 30 requêtes/minute/IP sur toutes les routes — ajustable si besoin
+// Audit 11/10 : l'ancien limiteur global (30 requêtes/minute/IP) est retiré. Il contredisait les seuils par
+// route définis plus haut (limiteurIP) : une mise à jour de 150 fiches de prospects en moins de 10 minutes
+// était refusée dès la 31e requête de la minute.
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const MODELE = process.env.GEMINI_MODEL || "gemini-2.5-flash";
@@ -342,6 +331,7 @@ app.post("/api/ttn/signer-et-envoyer", limiteurIP("envoi TTN", 30), verifierAuth
     let xmlSigne;
     try {
       const repSignature = await fetch(SIGNATURE_ENDPOINT, {
+        signal: AbortSignal.timeout(30000),
         method: "POST",
         headers: { "Content-Type": "application/xml; charset=utf-8", "Authorization": `Bearer ${SIGNATURE_TOKEN}` },
         body: xmlNonSigne,
@@ -373,6 +363,7 @@ app.post("/api/ttn/signer-et-envoyer", limiteurIP("envoi TTN", 30), verifierAuth
     let texteReponse;
     try {
       const repTTN = await fetch(EL_FATOORA_ENDPOINT, {
+        signal: AbortSignal.timeout(30000),
         method: "POST",
         headers: { "Content-Type": "text/xml; charset=utf-8", "SOAPAction": "DeposerFacture" },
         body: enveloppeSoap,
@@ -408,7 +399,7 @@ app.get("/api/ttn/statut", limiteurIP("statut TTN", 60), verifierAuthApplicative
     if (!EL_FATOORA_ENDPOINT_STATUT) return res.status(500).json({ ok: false, message: "EL_FATOORA_ENDPOINT_STATUT non configuré côté serveur." });
     const headers = {};
     if (EL_FATOORA_LOGIN) headers["Authorization"] = "Basic " + Buffer.from(`${EL_FATOORA_LOGIN}:${EL_FATOORA_PASSWORD}`).toString("base64");
-    const repTTN = await fetch(`${EL_FATOORA_ENDPOINT_STATUT}?numeroSuivi=${encodeURIComponent(numeroSuivi)}`, { headers });
+    const repTTN = await fetch(`${EL_FATOORA_ENDPOINT_STATUT}?numeroSuivi=${encodeURIComponent(numeroSuivi)}`, { headers, signal: AbortSignal.timeout(30000) });
     if (!repTTN.ok) return res.status(502).json({ ok: false, message: `Vérification de statut impossible (HTTP ${repTTN.status}).` });
     const data = await repTTN.json();
     res.json({ ok: true, statut: data && data.statut ? data.statut : null, brut: data });
@@ -747,6 +738,7 @@ const CHAMPS_PLACE = "id,displayName,formattedAddress,nationalPhoneNumber,intern
 async function geminiRechercheWeb(prompt) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(MODELE_RECHERCHE)}:generateContent`;
   const r = await fetch(url, {
+    signal: AbortSignal.timeout(80000), // sous le délai du proxy Render (100 s)
     method: "POST",
     headers: { "Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY },
     body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: prompt }] }], tools: [{ google_search: {} }] }),
@@ -809,6 +801,7 @@ function ficheDepuisPlace(pl) {
 }
 async function placeDetails(placeId, avecAvis) {
   const r = await fetch(`https://places.googleapis.com/v1/places/${encodeURIComponent(placeId)}?languageCode=fr`, {
+    signal: AbortSignal.timeout(15000),
     headers: { "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY, "X-Goog-FieldMask": CHAMPS_PLACE + (avecAvis ? ",reviews" : "") },
   });
   const j = await r.json();
@@ -818,6 +811,7 @@ async function placeDetails(placeId, avecAvis) {
 function nettoyerTexte(v, max) { return String(v || "").replace(/[\u0000-\u001f]/g, " ").slice(0, max).trim(); }
 async function rechercheGoogle(requete, zoneTexte, limite) {
   const r = await fetch("https://places.googleapis.com/v1/places:searchText", {
+    signal: AbortSignal.timeout(15000),
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY, "X-Goog-FieldMask": CHAMPS_PLACE.split(",").map(c => "places." + c).join(",") },
     body: JSON.stringify({ textQuery: `${requete} ${zoneTexte} Tunisie`, languageCode: "fr", regionCode: "TN", pageSize: Math.min(20, limite) }),
@@ -1012,6 +1006,18 @@ app.post("/api/email/envoyer", limiteurIP("envoi d'e-mails", 60), verifierAuthIA
     res.status(502).json({ ok: false, message: "Échec de l'envoi : " + m });
   }
 });
+
+// Audit 11/10 : sans gestionnaire d'erreurs, Express renvoyait au client une page HTML avec la trace
+// complète de l'erreur (NODE_ENV n'est pas défini sur Render) : JSON invalide, fichier trop gros, etc.
+app.use((err, req, res, next) => {
+  console.error("Erreur non gérée :", err);
+  if (res.headersSent) return next(err);
+  const tropGros = err && (err.type === "entity.too.large" || err.code === "LIMIT_FILE_SIZE" || err.status === 413);
+  const mauvaiseRequete = err && (err.type === "entity.parse.failed" || err.status === 400);
+  const code = tropGros ? 413 : mauvaiseRequete ? 400 : 500;
+  res.status(code).json({ ok: false, success: false, message: tropGros ? "Requête ou fichier trop volumineux." : mauvaiseRequete ? "Requête invalide (corps illisible)." : "Erreur interne du serveur." });
+});
+process.on("unhandledRejection", (raison) => { console.error("Promesse rejetée non gérée :", raison); });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
